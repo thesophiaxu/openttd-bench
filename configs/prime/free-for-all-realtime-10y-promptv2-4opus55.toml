@@ -1,0 +1,83 @@
+# Four Opus 5.5 seats through Claude Code: official Anthropic inference, Prime sandbox.
+# Requests still pass through verifiers' interception proxy for traces.jsonl / ATIF.
+# Opus 5.5 requires Claude Code >=2.1.280 (older clients are rejected by Anthropic).
+# Run: CONFIG=configs/prime/free-for-all-realtime-10y-promptv2-4opus55.toml scripts/run_ffa_realtime_10y.sh outputs/prime-ffa-realtime-10y-promptv2-4opus55
+model = "claude-opus-5-5"
+push = false
+
+[client]
+type = "eval"
+base_url = "https://api.anthropic.com/v1"
+api_key_var = "ANTHROPIC_API_KEY"
+
+[env]
+max_concurrent_agents = 4
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "mixed_hogex_realtime_10y"
+image = "python:3.12-slim-bookworm"
+model = "claude-opus-5-5"
+boot_seconds = 1200
+# Keep progress separate from concurrent runs of the same task and seed.
+progress_dir = "outputs/prime-ffa-realtime-10y-promptv2-4opus55/progress"
+save_dir = "outputs/prime-ffa-realtime-10y-promptv2-4opus55/saves"
+
+[env.taskset.params]
+llm_seats = 4
+
+[env.p1]
+model = "claude-opus-5-5"
+
+[env.p1.harness]
+id = "claude"
+version = "2.1.280"
+
+[env.p1.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p2]
+model = "claude-opus-5-5"
+
+[env.p2.harness]
+id = "claude"
+version = "2.1.280"
+
+[env.p2.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p3]
+model = "claude-opus-5-5"
+
+[env.p3.harness]
+id = "claude"
+version = "2.1.280"
+
+[env.p3.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p4]
+model = "claude-opus-5-5"
+
+[env.p4.harness]
+id = "claude"
+version = "2.1.280"
+
+[env.p4.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20

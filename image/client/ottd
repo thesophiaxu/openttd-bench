@@ -1,0 +1,4 @@
+#!/bin/sh
+# Agent-facing CLI. Auth comes from OPENTTD_API_URL / OPENTTD_API_TOKEN in the environment.
+export PYTHONPATH="/opt/openttd/client${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m openttd_client "$@"

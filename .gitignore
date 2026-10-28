@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Generated eval run artifacts (regenerable via `uv run eval`)
+outputs/
+
+# Throwaway probes and one-off run helpers
+scratch/
+
+# Claude Code worktrees live under the repo; never track them
+.claude/

@@ -1,0 +1,45 @@
+# One LLM via Prime API/Codex versus one native AAAHogEx v115.
+model = "openai/gpt-5.5"
+push = false
+
+[env]
+max_concurrent_agents = 1
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "mixed_hogex_realtime_10y"
+image = "python:3.12-slim-bookworm"
+seeds = [101]
+model = "openai/gpt-5.5"
+boot_seconds = 1200
+run_out_seconds = 12000
+progress_seconds = 60
+require_model_activity = true
+progress_dir = "outputs/prime-gpt55-vs-hogex-codex01621-ledger-v1-075x-s101-20261018/progress"
+save_dir = "outputs/prime-gpt55-vs-hogex-codex01621-ledger-v1-075x-s101-20261018/saves"
+
+[env.taskset.params]
+llm_seats = 1
+hogex_seats = 1
+starting_cash = 800_000
+loans = false
+allowed_modes = ["rail", "road"]
+game_speed_percent = 75
+
+[env.p1]
+model = "openai/gpt-5.5"
+max_output_tokens = 6000000
+[env.p1.sampling]
+max_tokens = 32000
+reasoning_effort = "high"
+[env.p1.harness]
+id = "codex-prime"
+version = "0.162.1"
+reasoning_effort = "high"
+[env.p1.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+idle_timeout = 14400

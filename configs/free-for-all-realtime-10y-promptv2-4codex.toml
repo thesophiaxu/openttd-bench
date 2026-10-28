@@ -1,0 +1,42 @@
+# Four-LLM mixed_hogex_realtime_10y (prompt v2) on LOCAL docker: four GPT-6 Astra seats through the Codex CLI
+# (harness `codex-cli`) on the host's ChatGPT login — no Prime sandbox, no interception, no API
+# billing. The taskset/interception model label stays a Prime id; the harness strips the prefix.
+# Run: CONFIG=configs/free-for-all-realtime-10y-promptv2-4codex.toml scripts/run_ffa_realtime_10y_docker.sh outputs/docker-ffa-realtime-10y-promptv2-4codex
+model = "openai/gpt-6-astra"
+push = false
+
+[env]
+max_concurrent_agents = 4
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "mixed_hogex_realtime_10y"
+image = "openttd-bench:v3"
+model = "openai/gpt-6-astra"
+
+[env.taskset.params]
+llm_seats = 4
+
+[env.p1.harness]
+id = "codex-cli"
+
+[env.p1.runtime]
+type = "docker"
+
+[env.p2.harness]
+id = "codex-cli"
+
+[env.p2.runtime]
+type = "docker"
+
+[env.p3.harness]
+id = "codex-cli"
+
+[env.p3.runtime]
+type = "docker"
+
+[env.p4.harness]
+id = "codex-cli"
+
+[env.p4.runtime]
+type = "docker"

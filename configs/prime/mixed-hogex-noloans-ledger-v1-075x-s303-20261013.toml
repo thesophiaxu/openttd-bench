@@ -1,0 +1,57 @@
+# One Astra + one Opus 5.5 via OpenCode, two native AAAHogEx v115.
+# Prime inference uses ~/.prime/config.json and PRIME_TEAM_ID from .env.
+model = "openai/gpt-6-astra"
+push = false
+
+[env]
+max_concurrent_agents = 2
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "mixed_hogex_realtime_10y"
+image = "python:3.12-slim-bookworm"
+seeds = [303]
+model = "mixed"
+boot_seconds = 1200
+run_out_seconds = 12000
+progress_seconds = 60
+require_model_activity = true
+launch_gate = "outputs/ledger-v1-four-game-series-20261013.release"
+progress_dir = "outputs/prime-mixed-astra-opus55-2hogex-800k-noloans-ledger-v1-075x-s303-20261013/progress"
+save_dir = "outputs/prime-mixed-astra-opus55-2hogex-800k-noloans-ledger-v1-075x-s303-20261013/saves"
+
+[env.taskset.params]
+llm_seats = 2
+hogex_seats = 2
+starting_cash = 800_000
+loans = false
+allowed_modes = ["rail", "road"]
+game_speed_percent = 75
+
+[env.p1]
+model = "openai/gpt-6-astra"
+max_output_tokens = 6000000
+[env.p1.harness]
+id = "opencode"
+provider_key = "prime"
+[env.p1.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+idle_timeout = 14400
+
+[env.p2]
+model = "anthropic/claude-opus-5.5"
+max_output_tokens = 6000000
+[env.p2.harness]
+id = "opencode"
+provider_key = "prime"
+[env.p2.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+idle_timeout = 14400

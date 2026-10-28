@@ -1,0 +1,72 @@
+# Four-LLM mixed_hogex_realtime_10y (prompt v1) on Prime with every seat played by Claude Code (harness `claude`),
+# each on a different model: p1 GPT-6 Astra, p2 Claude Opus 5, p3 Grok 4.6, p4 GLM 5.2. Same
+# world/grading/clock as free-for-all-realtime-10y-claude.toml; only the per-seat `model` differs.
+# Run: CONFIG=configs/prime/free-for-all-realtime-10y-4models.toml scripts/run_ffa_realtime_10y.sh outputs/prime-ffa-realtime-10y-4models
+model = "mixed"
+push = false
+
+[env]
+max_concurrent_agents = 4
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "mixed_hogex_realtime_10y"
+image = "python:3.12-slim-bookworm"
+model = "mixed"
+boot_seconds = 1200
+
+[env.taskset.params]
+llm_seats = 4
+prompt = "v1"
+
+[env.p1]
+model = "openai/gpt-6-astra"
+
+[env.p1.harness]
+id = "claude"
+
+[env.p1.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p2]
+model = "anthropic/claude-opus-5"
+
+[env.p2.harness]
+id = "claude"
+
+[env.p2.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p3]
+model = "x-ai/grok-4.6"
+
+[env.p3.harness]
+id = "claude"
+
+[env.p3.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
+
+[env.p4]
+model = "z-ai/glm-5.2"
+
+[env.p4.harness]
+id = "claude"
+
+[env.p4.runtime]
+type = "prime"
+vm = true
+cpu = 4
+memory = 8
+disk = 20
