@@ -59,3 +59,8 @@ OUTPUTS_DIR=$PWD/../outputs npm run dev -- -p 3100 -H 127.0.0.1   # dev server, 
 Bind the viewer to `127.0.0.1` when fronting it with `tailscale serve`: tailscaled itself
 listens on the tailnet address for the served port, and Node's default `::` bind collides.
 
+## License
+
+CC0-1.0.
+
+OpenTTD, OpenGFX, OpenSFX, RailwAI and AAAHogEx are downloaded at build time under their own licenses (mostly GPL).
