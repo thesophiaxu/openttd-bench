@@ -14,8 +14,8 @@ game; the injected GameScript never knows the goal.
 |---|---|---|---|---|---|---|
 | `two_towns_rail` | 1 LLM | none | deterministic flat map, 2 founded towns | rail | `ratio_to_target(PASS delivered, 3000)` | 2 years |
 | `versus_ai_rail` | 1 LLM | 3 × RailwAI | random (seeded) | rail | `0.6·ratio(operating profit, $3M) + 0.4·rank(place)` | 10 years |
-| `free_for_all` | 4 LLM | none | random (seeded) | all | same, per seat | 10 years |
-| `mixed_hogex_realtime_10y` | 1–4 LLM | 0–2 × AAAHogEx | random (seeded) | all, or per config | same, per seat | 10 years, real-time clock (75%: ~2 h 42 min; 25%: ~8 h 7 min) |
+| `free_for_all` | 4 LLM | none | random (seeded) | rail, road | same, per seat | 10 years |
+| `mixed_hogex_realtime_10y` | 1–4 LLM | 0–2 × AAAHogEx | random (seeded) | rail, road | same, per seat | 10 years, real-time clock (75%: ~2 h 42 min; 25%: ~8 h 7 min) |
 
 `mixed_hogex_realtime_10y` is configured by `[env.taskset.params]` (passed to its `spec`):
 `llm_seats`, `hogex_seats`, `starting_cash`, `loans`, `allowed_modes`, `game_speed_percent` and

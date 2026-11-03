@@ -124,7 +124,7 @@ def patch_speed(paths: Paths, percent: int) -> Path:
     return target
 
 
-def write_cfg(paths: Paths, world: dict[str, Any], admin_password: str) -> Path:
+def write_cfg(paths: Paths, world: dict[str, Any], admin_password: str, server_password: str) -> Path:
     m = world["map"]
     ports = world["ports"]
     companies = len(world["companies"])
@@ -201,6 +201,7 @@ server_name = openttd-bench
 server_port = {ports["game"]}
 server_admin_port = {ports["admin"]}
 admin_password = {admin_password}
+server_password = {server_password}
 allow_insecure_admin_login = true
 pause_on_join = false
 min_active_clients = 0
@@ -460,6 +461,9 @@ def ensure_users(paths: Paths, world: dict[str, Any]) -> None:
         except KeyError:
             subprocess.run(["useradd", "--create-home", "--shell", "/bin/bash", user], check=True)
             log(f"created user {user}")
+        # Before any seat launches: the harness writes its config into the home before it
+        # hands it over, and a default 755 home would expose it to rivals in that window.
+        os.chmod(pwd.getpwnam(user).pw_dir, 0o700)
 
 
 def write_seat_env(paths: Paths, world: dict[str, Any], seats: dict[str, Any]) -> None:
@@ -606,7 +610,9 @@ def main() -> None:
         fetch_content.install_hogex(paths.cache, paths.install, no_loans=no_loans)
         log("installed pinned AAAHogEx v115" + (" with zero-loan inflation guard" if no_loans else ""))
     patched = patch_speed(paths, percent)
-    cfg = write_cfg(paths, world, admin_password)
+    # Nobody joins the game port: the password (never handed out) keeps agents from joining
+    # as a network client and reading the whole map, rivals' finances and orders included.
+    cfg = write_cfg(paths, world, admin_password, secrets.token_hex(12))
     stage_scripts(paths)
     ensure_users(paths, world)
     game = launch_game(paths, patched, world, cfg)

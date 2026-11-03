@@ -25,6 +25,7 @@ from openttd_bench.payload import build_payload
 from openttd_bench.seats import SeatRuntime
 from openttd_bench.task_spec import TaskSpec
 from openttd_bench.taskset import OpenTTDSeatTask, OpenTTDTask, agent_budget_seconds
+from openttd_seat import SeatHarness
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +34,18 @@ ROOT = "/opt/openttd"
 BOOT_LOG = f"{ROOT}/boot.log"
 BOOT_MARKER = "/run/openttd/boot-complete"
 
+# The bearer token never crosses argv (world-readable via /proc/<pid>/cmdline, and Prime
+# wraps any `env` into a `sh -c` string): argv carries only the path of a 0600 file holding
+# it and the key to read — JSON (`seats.json`) or KEY=VALUE lines (`~agentN/.openttd_seat`).
 _API_SCRIPT = r"""
-import json, sys, urllib.request, urllib.error
-method, url, token, body, timeout = sys.argv[1:6]
+import json, os, sys, urllib.request, urllib.error
+method, url, token_path, token_key, body, timeout = sys.argv[1:7]
+with open(os.path.expanduser(token_path)) as f:
+    raw = f.read()
+try:
+    token = json.loads(raw)[token_key]
+except ValueError:
+    token = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)[token_key]
 data = body.encode() if body else None
 req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
 try:
@@ -45,14 +55,22 @@ except urllib.error.HTTPError as e:
     sys.stdout.write(json.dumps({"_http_error": e.code, "detail": e.read().decode(errors="replace")[:2000]}))
     sys.exit(3)
 """
+ADMIN_TOKEN = (f"{ROOT}/seats.json", "admin")
 
 
 async def box_api(
-    runtime: vf.Runtime, method: str, url: str, body: dict[str, Any] | None, token: str, timeout: float = 60
+    runtime: vf.Runtime,
+    method: str,
+    url: str,
+    body: dict[str, Any] | None,
+    token_file: tuple[str, str],
+    timeout: float = 60,
 ) -> dict[str, Any]:
-    """Call the in-box control plane from the host through `runtime.run` (loopback-only server)."""
+    """Call the in-box control plane from the host through `runtime.run` (loopback-only server).
+    `token_file` is `(path, key)` of the in-box file holding the bearer token, never the token."""
+    path, key = token_file
     result = await runtime.run(
-        ["python3", "-c", _API_SCRIPT, method, url, token, json.dumps(body) if body is not None else "", str(timeout)],
+        ["python3", "-c", _API_SCRIPT, method, url, path, key, json.dumps(body) if body is not None else "", str(timeout)],
         {},
     )
     text = (result.stdout or "").strip()
@@ -83,7 +101,7 @@ class GameBox:
     async def admin(
         self, method: str, path: str, body: dict[str, Any] | None = None, timeout: float = 60
     ) -> dict[str, Any]:
-        return await box_api(self.box, method, f"{self.api_url}{path}", body, self.seats["admin"], timeout)
+        return await box_api(self.box, method, f"{self.api_url}{path}", body, ADMIN_TOKEN, timeout)
 
     async def boot(self) -> dict[str, Any]:
         payload = build_payload(self.spec, self.seats, self.world)
@@ -129,6 +147,20 @@ class GameBox:
         tail = await self.box.run(["tail", "-c", "2000", BOOT_LOG], {})
         raise vf.SandboxError(f"world did not boot within {self.boot_seconds}s: {tail.stdout[-1500:]}")
 
+    async def reap(self, user: str) -> None:
+        """Kill everything the seat's Unix user still runs (a `setsid nohup` loop outlives
+        its harness). Repeated: a process may fork while the previous pass runs."""
+        for _ in range(5):
+            try:
+                result = await self.box.run(["pkill", "-KILL", "-u", user], {})
+            except vf.SandboxError as exc:
+                log.warning("reap %s: %s", user, exc)
+                return
+            if result.exit_code == 1:  # nothing matched: the user runs nothing
+                return
+            await asyncio.sleep(0.5)
+        log.warning("reap %s: processes kept appearing after 5 passes", user)
+
     async def retire(self, company: int) -> None:
         try:
             await self.admin("POST", "/api/admin/retire", {"company": company})
@@ -158,6 +190,46 @@ def pick_ports(idx: int) -> dict[str, int]:
     return {"game": base + 1, "admin": base + 2, "api": base + 3}
 
 
+def require_seat_harnesses(agents: Any, roles: list[str]) -> None:
+    """Fail closed before provisioning: seat isolation (own Unix user via setpriv, own token
+    file) lives in SeatHarness, and any other harness (the verifiers default is `bash`) runs
+    the seat as root, which reads every secret in the box."""
+    for role in roles:
+        harness = getattr(agents, role).harness
+        if not isinstance(harness, SeatHarness):
+            raise TypeError(
+                f"{role} uses harness {type(harness).__name__!r}; OpenTTD seats need a SeatHarness "
+                "(opencode, claude, codex-cli, codex-prime): others run as root and break seat isolation"
+            )
+
+
+class NoModelActivity(vf.SandboxError):
+    """A seat's harness exited without model activity (`require_model_activity`): the
+    episode is void, so it aborts at once instead of playing the rivals out."""
+
+
+async def settle(tasks: list[asyncio.Task], fatal: type[BaseException]) -> list[BaseException]:
+    """Await every seat; one seat failing never cancels its rivals. Returns the failures,
+    except a `fatal` one, which cancels the rest and is raised."""
+    pending = set(tasks)
+    failures: list[BaseException] = []
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                exc = finished.exception()
+                if isinstance(exc, fatal):
+                    raise exc
+                if exc is not None:
+                    failures.append(exc)
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return failures
+
+
 class OpenTTDEnvConfig(vf.EnvConfig):
     p1: vf.AgentConfig = vf.AgentConfig()
     p2: vf.AgentConfig = vf.AgentConfig()
@@ -179,6 +251,7 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
         config = self.taskset.config
         rotation = (task.data.idx or 0) % seats
         role_of = {company: ROLES[(company + rotation) % seats] for company in range(seats)}
+        require_seat_harnesses(agents, sorted(set(role_of.values())))
         tokens = make_seats(seats)
         token_of = {company: token for token, company in tokens["tokens"].items()}
         world = spec.world()
@@ -237,18 +310,25 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
                     trace.info["openttd_spec"] = spec.name
                     traces.append(trace)
                     if config.require_model_activity and not has_model_activity(trace.calls, trace.info):
-                        raise vf.SandboxError(
+                        raise NoModelActivity(
                             f"{role} exited without model activity: "
                             f"{trace.info.get('harness_output_tail', '')[-1000:]}"
                         )
                 finally:
+                    await game.reap(f"agent{company + 1}")
                     await game.retire(company)
 
             progress = asyncio.create_task(self.report_progress(game, task, config))
             try:
-                await asyncio.gather(*(play(company) for company in range(seats)))
+                seat_tasks = [asyncio.create_task(play(company)) for company in range(seats)]
+                failures = await settle(seat_tasks, NoModelActivity)
             finally:
                 progress.cancel()
+            if failures and not traces:
+                raise failures[0]
+            seat_failures = [f"{type(exc).__name__}: {exc}"[:500] for exc in failures]
+            for message in seat_failures:
+                log.warning("seat failed; the others are still run out and scored: %s", message)
             run_out = await game.run_out(config.run_out_seconds)
             log.info("run-out: %s", run_out)
             snapshot = await game.snapshot()
@@ -289,6 +369,7 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
                 trace.info["openttd_save"] = save_info
                 trace.info["openttd_run_out"] = run_out
                 trace.info["openttd_clock"] = spec.rules.clock
+                trace.info["openttd_seat_failures"] = seat_failures
 
     async def report_progress(self, game: GameBox, task: OpenTTDTask, config: Any) -> None:
         """While the seats play, append a snapshot line every `progress_seconds` to
@@ -334,4 +415,14 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
             trace.record_metrics(grader.metrics(task.spec, snapshot, int(company), outcome))
 
 
-__all__ = ["GameBox", "OpenTTDEnv", "OpenTTDEnvConfig", "box_api", "make_seats", "pick_ports"]
+__all__ = [
+    "GameBox",
+    "NoModelActivity",
+    "OpenTTDEnv",
+    "OpenTTDEnvConfig",
+    "box_api",
+    "make_seats",
+    "pick_ports",
+    "require_seat_harnesses",
+    "settle",
+]

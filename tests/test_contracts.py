@@ -73,7 +73,6 @@ def test_seat_launch_demotes_and_keeps_seat_env():
     view = SeatRuntime(box, "p3")
     view.env = {
         "OPENTTD_API_URL": "http://127.0.0.1:20003",
-        "OPENTTD_API_TOKEN": "tok3",
         "OPENTTD_SEAT": "2",
         "OPENTTD_SEAT_USER": "agent3",
     }
@@ -83,7 +82,7 @@ def test_seat_launch_demotes_and_keeps_seat_env():
     asyncio.run(harness.launch(ctx, trace, view, "http://127.0.0.1:5555/v1", "s", {}, data))
     argv, env = next(call for call in box.calls if call[0][0] == "setpriv")
     assert argv[:4] == ["setpriv", "--reuid=agent3", "--regid=agent3", "--init-groups"]
-    assert env["OPENTTD_API_TOKEN"] == "tok3" and env["OPENTTD_SEAT_USER"] == "agent3"
+    assert "OPENTTD_API_TOKEN" not in env and env["OPENTTD_SEAT_USER"] == "agent3"
     assert "/home/agent3/.config/opencode/opencode.json" in box.files
     assert trace.info["seat_user"] == "agent3" and "harness_output_tail" in trace.info
 
@@ -101,7 +100,6 @@ def test_seat_task_env_and_soft_stop():
     env = task.runtime_env()
     assert env == {
         "OPENTTD_API_URL": "http://127.0.0.1:1",
-        "OPENTTD_API_TOKEN": "t",
         "OPENTTD_SEAT": "2",
         "OPENTTD_SEAT_USER": "agent3",
     }

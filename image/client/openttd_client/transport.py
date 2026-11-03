@@ -1,4 +1,4 @@
-"""HTTP transport to the control plane (stdlib only; env-var auth)."""
+"""HTTP transport to the control plane (stdlib only; env-var or ~/.openttd_seat auth)."""
 
 from __future__ import annotations
 
@@ -18,10 +18,21 @@ class OpenTTDError(RuntimeError):
         self.detail = detail
 
 
+def _seat_file_token() -> str:
+    """The token from `~/.openttd_seat` (KEY=VALUE lines), for processes whose env lost it."""
+    try:
+        with open(os.path.expanduser("~/.openttd_seat")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    values = dict(line.split("=", 1) for line in lines if "=" in line)
+    return values.get("OPENTTD_API_TOKEN", "").strip()
+
+
 class Transport:
     def __init__(self, url: str | None = None, token: str | None = None, timeout: float = 120.0) -> None:
         self.url = (url or os.environ.get("OPENTTD_API_URL") or "http://127.0.0.1:8000").rstrip("/")
-        self.token = token if token is not None else os.environ.get("OPENTTD_API_TOKEN", "")
+        self.token = token if token is not None else (os.environ.get("OPENTTD_API_TOKEN") or _seat_file_token())
         self.timeout = timeout
 
     def request(

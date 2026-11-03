@@ -36,11 +36,22 @@ class SeatPaths:
     home: str
     workdir: str
     prompt_file: str
+    env_file: str
+    """The harness's `seat_env`, sourced by the demoted shell: secrets never ride argv."""
+    seat_file: str
+    """`OPENTTD_API_URL`/`OPENTTD_API_TOKEN`/`OPENTTD_SEAT`, written 0600 by init_game at boot."""
 
 
 def seat_paths(user: str) -> SeatPaths:
     home = f"/home/{user}"
-    return SeatPaths(user=user, home=home, workdir=f"{home}/work", prompt_file=f"{home}/task-prompt.md")
+    return SeatPaths(
+        user=user,
+        home=home,
+        workdir=f"{home}/work",
+        prompt_file=f"{home}/task-prompt.md",
+        env_file=f"{home}/.seat_env",
+        seat_file=f"{home}/.openttd_seat",
+    )
 
 
 def demoted(user: str, argv: list[str]) -> list[str]:
@@ -81,7 +92,8 @@ class SeatHarness(Harness[ConfigT], Generic[ConfigT]):
             [
                 "sh",
                 "-c",
-                f"mkdir -p {wanted} && chown -R {paths.user}:{paths.user} {paths.home} && chmod 700 {paths.home}",
+                f"mkdir -p {wanted} && chown -R {paths.user}:{paths.user} {paths.home} && chmod 700 {paths.home} "
+                f"&& chmod 600 {paths.env_file}",
             ],
             {},
         )
@@ -104,11 +116,16 @@ class SeatHarness(Harness[ConfigT], Generic[ConfigT]):
         files = self.seat_files(ctx, paths, endpoint, secret)
         for path, content in files.items():
             await runtime.write(path, content)
+        # Every value (the inference secret included) goes through a file in the 700 home:
+        # argv is world-readable via /proc/<pid>/cmdline for the life of the program.
+        variables = {"HOME": paths.home, **self.seat_env(ctx, paths, endpoint, secret)}
+        exports = "".join(f'export {k}="{v}"\n' for k, v in variables.items())
+        await runtime.write(paths.env_file, exports.encode())
         await self.prepare_home(runtime, paths, [posixpath.dirname(p) for p in files])
-        exports = " ".join(
-            f'{k}="{v}"' for k, v in {"HOME": paths.home, **self.seat_env(ctx, paths, endpoint, secret)}.items()
+        script = (
+            f"set -a; . {paths.seat_file} || exit 97; set +a; . {paths.env_file} || exit 97; "
+            f"{self.seat_script(paths)}"
         )
-        script = f"export {exports}; {self.seat_script(paths)}"
         result = await runtime.run_program(demoted(paths.user, ["bash", "-c", script]), self.config.resolved_env)
         trace.info["seat_user"] = paths.user
         trace.info["harness_output_tail"] = (result.stdout or "")[-OUTPUT_TAIL:]

@@ -45,6 +45,7 @@ def test_default_is_the_plain_four_llm_free_for_all():
     assert all(c.starting_cash == 2_000_000 for c in s.companies)
     assert "$2,000,000" not in s.companies[0].prompt and "Borrowing" not in s.companies[0].prompt
     assert "3 other companies played by other AI" in s.companies[0].prompt
+    assert s.rules.allowed_modes == {"rail", "road"}  # what the prompt says, also by default
 
 
 def test_four_llm_no_loans_announces_funding():
@@ -94,6 +95,7 @@ def test_three_company_rank_scaling():
 @pytest.mark.parametrize("params", [
     dict(llm_seats=0, hogex_seats=2), dict(llm_seats=1), dict(llm_seats=4, hogex_seats=1),
     dict(prompt="v1", game_speed_percent=25),
+    dict(allowed_modes=["rail"]), dict(allowed_modes=["rail", "road", "air"]),
 ])
 def test_rejected_parameters(params):
     with pytest.raises(ValueError):
@@ -103,3 +105,11 @@ def test_rejected_parameters(params):
 def test_unknown_parameter_is_an_error():
     with pytest.raises(TypeError):
         spec(101, no_loans=True)
+
+
+def test_free_for_all_rules_match_its_prompt():
+    from openttd_bench.tasks import free_for_all
+
+    s = free_for_all.spec(101)
+    assert s.rules.allowed_modes == {"rail", "road"}
+    assert "Allowed transport modes: rail and road." in s.companies[0].prompt

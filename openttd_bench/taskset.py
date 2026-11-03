@@ -81,9 +81,10 @@ class OpenTTDSeatTask(OpenTTDTask):
         self.user = user
 
     def runtime_env(self) -> dict[str, str]:
+        # No OPENTTD_API_TOKEN: a runtime may carry its env on a root wrapper's argv (Prime does),
+        # readable by every seat. The demoted shell sources it from `~agentN/.openttd_seat` (0600).
         return {
             "OPENTTD_API_URL": self.api_url,
-            "OPENTTD_API_TOKEN": self.token,
             "OPENTTD_SEAT": str(self.company),
             "OPENTTD_SEAT_USER": self.user,
         }
@@ -93,7 +94,9 @@ class OpenTTDSeatTask(OpenTTDTask):
         from openttd_bench.env import box_api
 
         try:
-            trace.info["openttd_retired"] = await box_api(runtime, "POST", f"{self.api_url}/api/retire", {}, self.token)
+            trace.info["openttd_retired"] = await box_api(
+                runtime, "POST", f"{self.api_url}/api/retire", {}, (f"~{self.user}/.openttd_seat", "OPENTTD_API_TOKEN")
+            )
         except Exception as exc:  # noqa: BLE001 - the env retires again anyway
             trace.info["openttd_retire_error"] = str(exc)
 

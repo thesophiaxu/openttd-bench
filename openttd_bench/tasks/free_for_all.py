@@ -1,4 +1,4 @@
-"""Experiment (c) free_for_all: four LLM seats, every transport mode, scored per seat.
+"""Experiment (c) free_for_all: four LLM seats, rail and road (as the prompt says), scored per seat.
 
 This file is the whole definition of the experiment: the world, the grading and the
 seats' system prompts (`PROMPT`, handed to each `llm(...)` seat in `spec` with its player
@@ -20,7 +20,7 @@ def spec(seed: int, model: str | None = None) -> TaskSpec:
         name=f"{NAME}-s{seed}",
         map=MapSpec(seed=seed, landscape="temperate", terrain_type=1, sea_level=1, town_density=2, industry_density=4),
         companies=[llm(player, model, PROMPT.replace("{player}", player)) for player in PLAYERS],
-        rules=Rules(duration_years=10),
+        rules=Rules(duration_years=10, allowed_modes={"rail", "road"}),
         objective=profit_rank_objective(),
         cargos=cargo_table("temperate"),
     )

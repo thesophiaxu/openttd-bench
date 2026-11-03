@@ -11,7 +11,7 @@ as keyword arguments); omitted parameters give the plain four-LLM free-for-all:
     hogex_seats = 2                     # native AAAHogEx companies after them (NoAI API)
     starting_cash = 800_000             # every company, $0 loan; omitted = engine default, unannounced
     loans = false                       # false = every company's maximum loan is zero
-    allowed_modes = ["rail", "road"]    # omitted = every mode
+    allowed_modes = ["rail", "road"]    # the only value: the prompt says rail and road
     game_speed_percent = 75             # 25 = three times the wall time
     prompt = "v2"                       # "v1": the first real-time prompt (75% speed only)
 
@@ -29,6 +29,7 @@ from openttd_bench.tasks.tasks_shared import cargo_table, profit_rank_objective
 
 NAME = "mixed_hogex_realtime_10y"
 HOGEX_CONFIG = {"disable_veh_ship": "1", "disable_veh_aircraft": "1"}
+RAIL_ROAD = frozenset({"rail", "road"})
 NUMBERS = {1: "one", 2: "two", 3: "three", 4: "four"}
 # The whole game's wall time as the prompt words it, per speed (75% says "2 h 40" for ~2 h 42).
 WALL_TIME = {75: "about 2 hours 40 minutes", 25: "about 8 hours 7 minutes"}
@@ -51,9 +52,10 @@ def spec(
         raise ValueError(f"need 1+ LLM seats and 2-4 companies, got {llm_seats} LLM + {hogex_seats} HogEx")
     if prompt == "v1" and game_speed_percent != 75:
         raise ValueError("prompt v1 describes the 75% clock only")
+    if allowed_modes is not None and set(allowed_modes) != RAIL_ROAD:
+        raise ValueError(f"the prompt says rail and road; allowed_modes={sorted(allowed_modes)} would contradict it")
     rules = Rules(duration_years=10, game_speed_percent=game_speed_percent, clock="realtime",
-                  max_loan=None if loans else 0,
-                  **({} if allowed_modes is None else {"allowed_modes": set(allowed_modes)}))
+                  max_loan=None if loans else 0, allowed_modes=set(RAIL_ROAD))
     funding = {} if starting_cash is None else {"starting_cash": starting_cash, "starting_loan": 0}
     players = [f"Player {i + 1}" for i in range(llm_seats)]
     text = prompt_for(prompt, llm_seats, hogex_seats, starting_cash, loans, game_speed_percent)

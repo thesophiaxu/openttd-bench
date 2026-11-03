@@ -49,7 +49,8 @@ def test_mixed_conditions_and_prompt():
 def test_engine_mode_restrictions(tmp_path):
     init = load_image_module("init_game")
     paths = init.Paths.make(tmp_path / "root", tmp_path / "runtime")
-    config = init.write_cfg(paths, spec(101).world(), "not-a-real-secret").read_text()
+    config = init.write_cfg(paths, spec(101).world(), "not-a-real-secret", "join-secret").read_text()
+    assert "server_password = join-secret" in config  # nobody may join the game port as a client
     assert "max_aircraft = 0" in config and "max_ships = 0" in config
     assert "max_trains = 0" not in config and "max_roadveh = 0" not in config
     assert "script_max_opcode_till_suspend = 250000" in config

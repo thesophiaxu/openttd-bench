@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -74,7 +75,6 @@ def seat_view(box: Runtime, role: str, user: str) -> SeatRuntime:
     view = SeatRuntime(box, role)
     view.env = {
         "OPENTTD_API_URL": "http://127.0.0.1:20003",
-        "OPENTTD_API_TOKEN": "tok",
         "OPENTTD_SEAT": "2",
         SEAT_USER_ENV: user,
     }
@@ -117,12 +117,18 @@ def test_seat_layer_writes_then_prepares_then_demotes():
     assert "mkdir -p /home/agent3/.echo /home/agent3/work" in prep_argv[2]
     assert "chown -R agent3:agent3 /home/agent3" in prep_argv[2] and "chmod 700 /home/agent3" in prep_argv[2]
     # The program runs demoted, with HOME plus the harness variables exported and the seat env kept.
+    # The exports live in a 0600 file the demoted shell sources, never on argv.
+    assert box.files["/home/agent3/.seat_env"] == b'export HOME="/home/agent3"\nexport ECHO_MODEL="moonshotai/kimi-k3"\n'
+    assert box.order.index("write:/home/agent3/.seat_env") < prep_index
+    assert "chmod 600 /home/agent3/.seat_env" in prep_argv[2]
     argv, env = box.calls[1]
     assert argv[:4] == ["setpriv", "--reuid=agent3", "--regid=agent3", "--init-groups"]
     assert argv[4:6] == ["bash", "-c"]
-    assert argv[6].startswith('export HOME="/home/agent3" ECHO_MODEL="moonshotai/kimi-k3"; ')
+    assert argv[6].startswith(
+        "set -a; . /home/agent3/.openttd_seat || exit 97; set +a; . /home/agent3/.seat_env || exit 97; "
+    )
     assert argv[6].endswith("cat /home/agent3/task-prompt.md")
-    assert env["OPENTTD_API_TOKEN"] == "tok" and env[SEAT_USER_ENV] == "agent3" and env["EXTRA"] == "1"
+    assert env[SEAT_USER_ENV] == "agent3" and env["EXTRA"] == "1"
     assert result.exit_code == 0
     assert trace.info["seat_user"] == "agent3"
     assert trace.info["harness_output_tail"] == "program output"
@@ -163,7 +169,8 @@ def test_opencode_files_env_script_and_summary():
     assert config["provider"]["moonshotai"]["options"]["baseURL"] == "http://127.0.0.1:5555/v1"
     argv, _ = box.calls[1]
     script = argv[6]
-    assert 'PATH="/opt/opencode/bin:$PATH"' in script and 'OPENCODE_DISABLE_FILETIME_CHECK="true"' in script
+    exports = box.files["/home/agent3/.seat_env"].decode()
+    assert 'PATH="/opt/opencode/bin:$PATH"' in exports and 'OPENCODE_DISABLE_FILETIME_CHECK="true"' in exports
     assert script.endswith("cd /home/agent3/work && cat /home/agent3/task-prompt.md | opencode run 2>&1")
     # The store walk runs as root on the seat home and lands in the trace.
     summary_argv, _ = box.calls[2]
@@ -178,9 +185,10 @@ def test_claude_env_and_script():
     _, trace = launch(harness, box, model="anthropic/claude-sonnet-4.5", endpoint="http://127.0.0.1:5555/v1")
     argv, _ = box.calls[1]
     script = argv[6]
-    assert 'ANTHROPIC_BASE_URL="http://127.0.0.1:5555"' in script  # dialect route is <base>/v1/messages
-    assert 'ANTHROPIC_API_KEY="s3cret"' in script and 'ANTHROPIC_MODEL="anthropic/claude-sonnet-4.5"' in script
-    assert 'CLAUDE_CONFIG_DIR="/home/agent3/.claude"' in script
+    exports = box.files["/home/agent3/.seat_env"].decode()
+    assert 'ANTHROPIC_BASE_URL="http://127.0.0.1:5555"' in exports  # dialect route is <base>/v1/messages
+    assert 'ANTHROPIC_API_KEY="s3cret"' in exports and 'ANTHROPIC_MODEL="anthropic/claude-sonnet-4.5"' in exports
+    assert 'CLAUDE_CONFIG_DIR="/home/agent3/.claude"' in exports
     assert script.endswith("claude -p --dangerously-skip-permissions --output-format text 2>&1")
     assert "/home/agent3/.claude/.keep" in box.files
     assert "mkdir -p /home/agent3/.claude /home/agent3/work" in box.calls[0][0][2]
@@ -194,3 +202,31 @@ def test_harness_ids_load_through_verifiers(harness_id, module):
     cls = harness_class(harness_id)
     assert cls.__module__.startswith(module)
     assert issubclass(cls, SeatHarness)
+
+
+@pytest.mark.parametrize("harness", [
+    ClaudeHarness(ClaudeHarnessConfig(id="claude")),
+    OpenCodeHarness(OpenCodeHarnessConfig(id="opencode")),
+])
+def test_no_secret_ever_rides_argv(harness):
+    """argv is world-readable (/proc/<pid>/cmdline): the inference secret may appear neither in
+    any argv nor in the env a runtime might flatten onto argv (Prime wraps env into `sh -c`)."""
+    box = FakeBox(summary={})
+    launch(harness, box)
+    for argv, env in box.calls:
+        assert "s3cret" not in " ".join(argv) + " ".join(env.values()), argv
+    assert any(b"s3cret" in data for data in box.files.values())  # it reached the program by file
+
+
+def test_client_reads_the_seat_file_when_the_env_lacks_the_token(tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "image" / "client"))
+    from openttd_client.transport import Transport
+
+    (tmp_path / ".openttd_seat").write_text("OPENTTD_API_URL=http://x\nOPENTTD_API_TOKEN=abc123\nOPENTTD_SEAT=1\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("OPENTTD_API_TOKEN", raising=False)
+    assert Transport().token == "abc123"
+    monkeypatch.setenv("OPENTTD_API_TOKEN", "from-env")
+    assert Transport().token == "from-env"

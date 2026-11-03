@@ -210,6 +210,9 @@ class Core:
             raise HTTPException(400, f"a batch holds at most {MAX_BATCH} items")
         if not self.gs_ready:
             raise HTTPException(503, "the game is still booting")
+        if seat in self.retired:
+            # A retired seat's rollout is over: a leftover process must not keep playing.
+            raise HTTPException(409, "this seat has retired: its rollout is over and no further command counts")
         self.seat_acts(seat)
         self.barrier.cancel_detached(seat)
         prepared: list[dict[str, Any]] = []
