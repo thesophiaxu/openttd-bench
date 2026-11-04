@@ -3,15 +3,22 @@
 # world/grading/clock as free-for-all-realtime-10y-claude.toml; only the per-seat `model` differs.
 # Run: CONFIG=configs/prime/free-for-all-realtime-10y-4models.toml scripts/run_ffa_realtime_10y.sh outputs/prime-ffa-realtime-10y-4models
 model = "mixed"
-push = false
 
 [env]
 max_concurrent_agents = 4
 
+# Server owns game resources; every role has a separate root VM.
+[env.server]
+type = "prime"
+image = "python:3.12-slim-bookworm"
+cpu = 4
+memory = 8
+disk = 20
+idle_timeout = 43200
+
 [env.taskset]
 id = "openttd_bench"
 experiment = "mixed_hogex_realtime_10y"
-image = "python:3.12-slim-bookworm"
 model = "mixed"
 boot_seconds = 1200
 
@@ -27,10 +34,12 @@ id = "claude"
 
 [env.p1.runtime]
 type = "prime"
-vm = true
-cpu = 4
-memory = 8
-disk = 20
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 43200
 
 [env.p2]
 model = "anthropic/claude-opus-5"
@@ -40,10 +49,12 @@ id = "claude"
 
 [env.p2.runtime]
 type = "prime"
-vm = true
-cpu = 4
-memory = 8
-disk = 20
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 43200
 
 [env.p3]
 model = "x-ai/grok-4.6"
@@ -53,10 +64,12 @@ id = "claude"
 
 [env.p3.runtime]
 type = "prime"
-vm = true
-cpu = 4
-memory = 8
-disk = 20
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 43200
 
 [env.p4]
 model = "z-ai/glm-5.2"
@@ -66,7 +79,9 @@ id = "claude"
 
 [env.p4.runtime]
 type = "prime"
-vm = true
-cpu = 4
-memory = 8
-disk = 20
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 43200

@@ -36,7 +36,7 @@ def run(path: Path) -> int:
             try:
                 command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode()
                 pid = int(entry.name)
-                if ".venv/bin/eval " in command and "-m openttd_bench.run_with_atif" not in command and any(root in command for root in roots):
+                if any(binary in command for binary in (".venv/bin/vf-run ", ".venv/bin/eval ")) and "-m openttd_bench.run_with_atif" not in command and any(root in command for root in roots):
                     os.killpg(os.getpgid(pid), signal.SIGTERM)
             except (OSError, UnicodeDecodeError):
                 pass

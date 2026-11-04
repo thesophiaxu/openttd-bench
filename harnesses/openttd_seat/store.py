@@ -1,6 +1,6 @@
 """Session-store summaries: what a seat's program did, read from its own on-disk store.
 
-Runs as root inside the box after the program exits (the seat home is 700), and returns a
+Runs as root inside the VM during harness cleanup, and returns a
 small JSON-able dict for `trace.info["harness_session"]`: enough for a summarizer or the
 viewer to say how many turns, tokens and tool calls a seat used without opening the sandbox.
 """
@@ -95,7 +95,7 @@ print(json.dumps(out))
 # payloads carry messages and function calls.
 CODEX_SUMMARY = r"""
 import glob, json, sys
-base = sys.argv[1] + "/.codex/sessions"
+base = sys.argv[1] + "/.codex"
 out = {"store": "codex_cli", "sessions": 0, "messages": 0, "assistant_messages": 0, "output_tokens": 0,
        "reasoning_tokens": 0, "input_tokens": 0, "cache_read_tokens": 0, "tool_calls": 0, "tools": {},
        "first_ms": None, "last_ms": None}
@@ -105,7 +105,8 @@ def ms(ts):
         return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
     except Exception:
         return None
-for f in glob.glob(base + "/**/*.jsonl", recursive=True):
+for f in (glob.glob(base + "/sessions/**/*.jsonl", recursive=True)
+          + glob.glob(base + "/archived_sessions/**/*.jsonl", recursive=True)):
     out["sessions"] += 1
     total = None
     for line in open(f, errors="replace"):
@@ -139,11 +140,36 @@ print(json.dumps(out))
 """
 
 
+# Bound both work inside the VM and bytes returned through Runtime.run. Cleanup also
+# imposes a host-side timeout for an unreachable runtime. Never surface raw stderr:
+# the store belongs to the agent and may contain model credentials.
+BOUNDED_SUMMARY = r'''
+import io, resource, signal, sys
+signal.alarm(20)
+resource.setrlimit(resource.RLIMIT_CPU, (15, 15))
+resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+class Output(io.StringIO):
+    def write(self, value):
+        if self.tell() + len(value) > 65536:
+            raise ValueError("summary output limit")
+        return super().write(value)
+script = sys.argv.pop(1)
+original, sys.stdout = sys.stdout, Output()
+exec(script)
+original.write(sys.stdout.getvalue())
+'''
+
+
 async def _run_summary(runtime: Runtime, script: str, home: str) -> dict[str, Any]:
-    result = await runtime.run(["python3", "-c", script, home], {})
+    result = await runtime.run(["python3", "-c", BOUNDED_SUMMARY, script, home], {})
     if result.exit_code != 0:
-        return {"error": (result.stderr or result.stdout).strip()[-300:]}
-    return json.loads(result.stdout.strip().splitlines()[-1])
+        return {"error": "session summary process failed"}
+    if len(result.stdout) > 65536:
+        return {"error": "session summary output limit"}
+    summary = json.loads(result.stdout.strip())
+    if not isinstance(summary, dict):
+        raise ValueError("invalid session summary")
+    return summary
 
 
 async def opencode_session_summary(runtime: Runtime, home: str) -> dict[str, Any]:

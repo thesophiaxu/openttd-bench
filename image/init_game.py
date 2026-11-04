@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import re
 import secrets
 import shutil
@@ -195,6 +194,9 @@ units = metric
 [gui]
 autosave_interval = 0
 
+[server_bind_addresses]
+127.0.0.1
+
 [network]
 server_game_type = local
 server_name = openttd-bench
@@ -309,7 +311,8 @@ def start_control_plane(paths: Paths, world: dict[str, Any], seats_path: Path, a
         "uvicorn",
         "server.app:app",
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
+        "--no-proxy-headers",
         "--port",
         str(ports["api"]),
         "--log-level",
@@ -437,88 +440,6 @@ def seat_companies(admin: Admin, world: dict[str, Any]) -> None:
         log(f"seated slot {slot}: {line}")
 
 
-def wait_funded(admin: Admin, world: dict[str, Any], timeout: float = 60) -> None:
-    wanted = {int(c["slot"]): int(c["starting_cash"]) for c in world["companies"]}
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        reply = admin.batch([{"cmd": "sys.company_states", "args": {}}])[0]
-        rows = {int(r["id"]): r for r in reply.get("result", {}).get("companies", [])}
-        ok = all(slot in rows and abs(int(rows[slot]["cash"]) - cash) <= 1000 for slot, cash in wanted.items())
-        if ok:
-            log("every company funded: " + ", ".join(f"{s}=${int(rows[s]['cash']):,}" for s in wanted))
-            return
-        time.sleep(0.5)
-    raise SystemExit("companies were not funded in time")
-
-
-def ensure_users(paths: Paths, world: dict[str, Any]) -> None:
-    if paths.dev:
-        return
-    for slot in range(int(world["llm_seats"])):
-        user = f"agent{slot + 1}"
-        try:
-            pwd.getpwnam(user)
-        except KeyError:
-            subprocess.run(["useradd", "--create-home", "--shell", "/bin/bash", user], check=True)
-            log(f"created user {user}")
-        # Before any seat launches: the harness writes its config into the home before it
-        # hands it over, and a default 755 home would expose it to rivals in that window.
-        os.chmod(pwd.getpwnam(user).pw_dir, 0o700)
-
-
-def write_seat_env(paths: Paths, world: dict[str, Any], seats: dict[str, Any]) -> None:
-    by_company = {int(c): t for t, c in seats["tokens"].items()}
-    url = f"http://127.0.0.1:{world['ports']['api']}"
-    for slot in range(int(world["llm_seats"])):
-        token = by_company.get(slot)
-        if token is None:
-            continue
-        if paths.dev:
-            target = paths.home / f"agent{slot + 1}.env"
-            target.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            user = pwd.getpwnam(f"agent{slot + 1}")
-            target = Path(user.pw_dir) / ".openttd_seat"
-        target.write_text(f"OPENTTD_API_URL={url}\nOPENTTD_API_TOKEN={token}\nOPENTTD_SEAT={slot}\n")
-        target.chmod(0o600)
-        if not paths.dev:
-            os.chown(target, user.pw_uid, user.pw_gid)
-
-
-def install_client(paths: Paths) -> None:
-    """World-readable client + `ottd` on PATH + a .pth so `import openttd_client` works for every user."""
-    if paths.dev:
-        return
-    # The root dir stays traversable (755): agents need client/ and schema.json; everything
-    # sensitive below it is 700.
-    os.chmod(paths.root, 0o755)
-    subprocess.run(["chmod", "-R", "a+rX", str(paths.root / "client"), str(paths.root / "schema.json")], check=True)
-    shutil.copy(paths.root / "client" / "ottd", "/usr/local/bin/ottd")
-    os.chmod("/usr/local/bin/ottd", 0o755)
-    site = subprocess.run(
-        [sys.executable, "-c", "import site; print(site.getsitepackages()[0])"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    Path(site, "openttd_client.pth").write_text(str(paths.root / "client") + "\n")
-    for name in (
-        "server",
-        "game",
-        "ai",
-        "init_game.py",
-        "patch_speed.py",
-        "fetch_content.py",
-        "world.json",
-        "seats.json",
-    ):
-        target = paths.root / name
-        if target.exists():
-            subprocess.run(["chmod", "-R", "go-rwx", str(target)], check=True)
-    for name in ("run", "install"):
-        subprocess.run(["chmod", "-R", "go-rwx", str(paths.run if name == "run" else paths.install)], check=True)
-
-
 def ensure_python_deps() -> None:
     try:
         import fastapi  # noqa: F401
@@ -535,7 +456,7 @@ def ensure_system_deps(paths: Paths) -> None:
     if paths.dev:
         return
     missing = [lib for lib in ("libgomp.so.1", "libglib-2.0.so.0") if not _lib_present(lib)]
-    if missing or shutil.which("setpriv") is None:
+    if missing:
         log(f"installing system libraries (bootstrap path): {missing}")
         subprocess.run(["apt-get", "update", "-qq"], check=True, stdout=subprocess.DEVNULL)
         subprocess.run(
@@ -547,8 +468,6 @@ def ensure_system_deps(paths: Paths) -> None:
                 "--no-install-recommends",
                 "libgomp1",
                 "libglib2.0-0",
-                "util-linux",
-                "procps",
                 "ca-certificates",
             ],
             check=True,
@@ -614,7 +533,6 @@ def main() -> None:
     # as a network client and reading the whole map, rivals' finances and orders included.
     cfg = write_cfg(paths, world, admin_password, secrets.token_hex(12))
     stage_scripts(paths)
-    ensure_users(paths, world)
     game = launch_game(paths, patched, world, cfg)
     api = start_control_plane(paths, world, seats_path, admin_password)
     admin = Admin(f"http://127.0.0.1:{ports['api']}", seats["admin"])
@@ -628,12 +546,9 @@ def main() -> None:
         verify_cargo_table(world, reply)
         found_towns(admin, world)
         seat_companies(admin, world)
-        wait_funded(admin, world)
         for hook in world.get("lifecycle", []):
             log(f"lifecycle hook {hook!r} requested but none are registered this iteration")
         state = admin.call("POST", "/api/admin/pause", {})
-        write_seat_env(paths, world, seats)
-        install_client(paths)
         admin.call("POST", "/api/admin/ready", {})
         log(f"boot complete: paused at date {state.get('date')} year {state.get('year')}; api :{ports['api']}")
     except BaseException:

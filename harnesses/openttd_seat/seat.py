@@ -1,30 +1,25 @@
-"""SeatHarness: the per-seat plumbing shared by every harness (plan: plans/harness-layout.md).
+"""Shared CLI plumbing for an agent's isolated, root-run VM.
 
-A seat is a Unix user on the shared box (`agentN`, minted by the env and handed over as
-`OPENTTD_SEAT_USER`). This module owns the seat's home layout, the root-run preparation of
-that home, the `setpriv` demotion that makes the control plane the authorization boundary
-between seats, and the trace keys every harness records. A harness adds only its program:
-how to install it (`setup`), which files it needs in the seat home (`seat_files`), the
-shell line that runs it (`seat_script`), and optionally a summary of its session store
-(`session_summary`).
+The historical SeatHarness/SeatPaths names are retained for plugin compatibility.
+Task.setup installs the client credential file; the harness never sources it.
 """
 
 from __future__ import annotations
 
-import posixpath
+import asyncio
+import json
+import shlex
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
-from pydantic import Field
 from verifiers.v1 import Harness, HarnessConfig, ModelContext, ProgramResult, Runtime, TaskData, Trace
 
-SEAT_USER_ENV = "OPENTTD_SEAT_USER"
 OUTPUT_TAIL = 3000
+CAPTURE_TIMEOUT = 30
 
 
 class SeatConfig(HarnessConfig):
-    user: str = Field(default="agent1", pattern=r"^[a-z_][a-z0-9_-]*$")
-    """Unix user to run as; a seat task overrides it through OPENTTD_SEAT_USER."""
+    pass
 
 
 ConfigT = TypeVar("ConfigT", bound=SeatConfig)
@@ -32,73 +27,35 @@ ConfigT = TypeVar("ConfigT", bound=SeatConfig)
 
 @dataclass(frozen=True)
 class SeatPaths:
-    user: str
     home: str
     workdir: str
     prompt_file: str
-    env_file: str
-    """The harness's `seat_env`, sourced by the demoted shell: secrets never ride argv."""
-    seat_file: str
-    """`OPENTTD_API_URL`/`OPENTTD_API_TOKEN`/`OPENTTD_SEAT`, written 0600 by init_game at boot."""
 
 
-def seat_paths(user: str) -> SeatPaths:
-    home = f"/home/{user}"
-    return SeatPaths(
-        user=user,
-        home=home,
-        workdir=f"{home}/work",
-        prompt_file=f"{home}/task-prompt.md",
-        env_file=f"{home}/.seat_env",
-        seat_file=f"{home}/.openttd_seat",
-    )
-
-
-def demoted(user: str, argv: list[str]) -> list[str]:
-    """The argv that runs `argv` as `user` with a fresh group set."""
-    return ["setpriv", f"--reuid={user}", f"--regid={user}", "--init-groups", *argv]
+def seat_paths(home: str = "/root", workdir: str = "/work") -> SeatPaths:
+    return SeatPaths(home=home, workdir=workdir, prompt_file=f"{home}/task-prompt.md")
 
 
 class SeatHarness(Harness[ConfigT], Generic[ConfigT]):
     SUPPORTS_MCP = False
     SUPPORTS_RESUME = False
 
-    # ---- hooks a harness implements -------------------------------------------------
-
     def seat_files(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, bytes]:
-        """Files to write into the seat home before launch (config, credentials), path -> bytes."""
+        """Config and model credentials to write before launch."""
         return {}
 
     def seat_env(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, str]:
-        """Variables exported inside the demoted shell (HOME is always set from `paths`)."""
+        """Model environment passed directly through the runtime API, not shell text."""
         return {}
 
     def seat_script(self, paths: SeatPaths) -> str:
-        """The shell line that runs the program on `paths.prompt_file` from `paths.workdir`."""
         raise NotImplementedError
 
     async def session_summary(self, runtime: Runtime, paths: SeatPaths) -> dict[str, Any]:
-        """What the program's own session store says it did; runs as root after exit."""
         return {}
 
-    # ---- the shared launch ------------------------------------------------------------
-
     def paths_for(self, runtime: Runtime) -> SeatPaths:
-        return seat_paths(runtime.env.get(SEAT_USER_ENV) or self.config.user)
-
-    async def prepare_home(self, runtime: Runtime, paths: SeatPaths, dirs: list[str]) -> None:
-        wanted = " ".join(sorted({paths.workdir, *dirs}))
-        prep = await runtime.run(
-            [
-                "sh",
-                "-c",
-                f"mkdir -p {wanted} && chown -R {paths.user}:{paths.user} {paths.home} && chmod 700 {paths.home} "
-                f"&& chmod 600 {paths.env_file}",
-            ],
-            {},
-        )
-        if prep.exit_code != 0:
-            raise RuntimeError(f"seat home preparation failed: {prep.stderr.strip()[-500:]}")
+        return seat_paths(runtime.home or "/root", runtime.config.workdir or "/work")
 
     async def launch(
         self,
@@ -116,21 +73,28 @@ class SeatHarness(Harness[ConfigT], Generic[ConfigT]):
         files = self.seat_files(ctx, paths, endpoint, secret)
         for path, content in files.items():
             await runtime.write(path, content)
-        # Every value (the inference secret included) goes through a file in the 700 home:
-        # argv is world-readable via /proc/<pid>/cmdline for the life of the program.
-        variables = {"HOME": paths.home, **self.seat_env(ctx, paths, endpoint, secret)}
-        exports = "".join(f'export {k}="{v}"\n' for k, v in variables.items())
-        await runtime.write(paths.env_file, exports.encode())
-        await self.prepare_home(runtime, paths, [posixpath.dirname(p) for p in files])
-        script = (
-            f"set -a; . {paths.seat_file} || exit 97; set +a; . {paths.env_file} || exit 97; "
-            f"{self.seat_script(paths)}"
-        )
-        result = await runtime.run_program(demoted(paths.user, ["bash", "-c", script]), self.config.resolved_env)
-        trace.info["seat_user"] = paths.user
-        trace.info["harness_output_tail"] = (result.stdout or "")[-OUTPUT_TAIL:]
-        try:
-            trace.info["harness_session"] = await self.session_summary(runtime, paths)
-        except Exception as exc:  # the summary is diagnostics; never fail a scored episode over it
-            trace.info["harness_session"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+        env = {**self.config.resolved_env, "HOME": paths.home, **self.seat_env(ctx, paths, endpoint, secret)}
+        script = f"mkdir -p {shlex.quote(paths.workdir)} || exit; {self.seat_script(paths)}"
+        result = await runtime.run(["bash", "-c", script], env)
+        # Do not copy model credentials into trace diagnostics, even if a CLI echoes them.
+        secrets = [secret, *(v for k, v in env.items() if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET")))]
+        for path, content in files.items():
+            if path.endswith("/auth.json"):
+                auth = json.loads(content)
+                secrets.extend(v for v in (auth.get("tokens") or {}).values() if isinstance(v, str))
+        output = result.stdout or ""
+        for value in sorted(filter(None, secrets), key=len, reverse=True):
+            output = output.replace(value, "[REDACTED]")
+        trace.info["harness_output_tail"] = output[-OUTPUT_TAIL:]
         return result
+
+    async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
+        """Upstream calls this on success and abort, before releasing the VM."""
+        if "harness_session" in trace.info:
+            return
+        try:
+            summary = await asyncio.wait_for(self.session_summary(runtime, self.paths_for(runtime)), CAPTURE_TIMEOUT)
+        except Exception as exc:  # diagnostics must not fail the episode or echo credential-bearing errors
+            summary = {"error": f"session capture failed ({type(exc).__name__})"}
+        trace.info["harness_session"] = summary
+        trace.info["harness_capture_partial"] = "harness_output_tail" not in trace.info

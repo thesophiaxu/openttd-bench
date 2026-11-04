@@ -1,0 +1,59 @@
+# Three Prime VMs, two real inference agents, one-year 4x paused-clock smoke.
+model = "deepseek/deepseek-v4.1-flash-1017"
+
+[env]
+max_concurrent_agents = 2
+[env.timeout]
+episode = 1800
+[env.retries]
+max_retries = 0
+
+[env.server]
+type = "prime"
+image = "python:3.12-slim-bookworm"
+cpu = 2
+memory = 4
+disk = 10
+idle_timeout = 2400
+
+[env.taskset]
+id = "openttd_bench"
+experiment = "sandbox_smoke"
+seeds = [101]
+model = "deepseek/deepseek-v4.1-flash-1017"
+boot_seconds = 900
+agent_seconds = 360
+run_out_seconds = 300
+progress_seconds = 15
+
+[env.p1]
+max_turns = 12
+max_output_tokens = 16000
+[env.p1.sampling]
+max_tokens = 4096
+[env.p1.harness]
+id = "bash"
+[env.p1.runtime]
+type = "prime"
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 1200
+
+[env.p2]
+max_turns = 12
+max_output_tokens = 16000
+[env.p2.sampling]
+max_tokens = 4096
+[env.p2.harness]
+id = "bash"
+[env.p2.runtime]
+type = "prime"
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
+idle_timeout = 1200

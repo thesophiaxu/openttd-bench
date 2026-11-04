@@ -11,21 +11,25 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shlex
 import time
 
 from prime_sandboxes import AsyncSandboxClient
 
+if __package__:
+    from .runtime_inventory import active_agents
+else:
+    from runtime_inventory import active_agents
+
 REMOTE = r'''
 import base64,hashlib,io,json,tarfile
 from pathlib import Path
-home=Path('/home/agent1')
+home=Path('/root')
 buf=io.BytesIO()
 with tarfile.open(fileobj=buf,mode='w:gz') as tar:
  for name in ('codex-exec.jsonl','.codex/sessions','.codex/archived_sessions'):
   p=home/name
-  if not p.exists() or p.is_symlink():continue
+  if not p.exists() or p.is_symlink() or any(x.is_symlink() for x in p.parents if x != home):continue
   files=[p] if p.is_file() else sorted(p.rglob('*.jsonl'))
   for f in files:
    if f.is_symlink() or not f.is_file():continue
@@ -41,20 +45,11 @@ print(json.dumps({'sha256':hashlib.sha256(data).hexdigest(),'gzip_b64':base64.b6
 TERMINAL = {'complete', 'complete_with_issues', 'failed', 'cancelled', 'cancelled_before_launch'}
 
 
-async def main(series, interval):
-    client = AsyncSandboxClient(api_key=json.loads((Path.home() / '.prime/config.json').read_text())['api_key'])
-
-    async def capture(item):
-        root = Path(item['out'])
+async def capture_run(client, root: Path):
+    for agent in active_agents(root):
+        attribution = {key: agent[key] for key in ('role', 'company', 'sandbox_id', 'trace_id', 'spec', 'task_idx')}
         try:
-            manifest = json.loads((root / 'manifest.json').read_text())
-            if manifest['status'] not in ('launching', 'running'):
-                return
-            log = root / 'eval.log'
-            matches = re.findall(r'prime: sandbox ([a-z0-9]+) up', log.read_text()) if log.exists() else []
-            if not matches:
-                return
-            result = await client.execute_command(matches[-1], 'python3 -c ' + shlex.quote(REMOTE), timeout=45)
+            result = await client.execute_command(agent['sandbox_id'], 'python3 -c ' + shlex.quote(REMOTE), timeout=45)
             if result.exit_code:
                 raise RuntimeError(f'snapshot command exit {result.exit_code}')
             payload = json.loads(result.stdout)
@@ -67,12 +62,27 @@ async def main(series, interval):
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as file:
                 file.write(data)
-            record = {'captured_unix': time.time(), 'sandbox_id': matches[-1], 'bytes': len(data),
+            record = {'captured_unix': time.time(), **attribution, 'bytes': len(data),
                       'sha256': payload['sha256'], 'file': str(target)}
             target.with_suffix('.json').write_text(json.dumps(record, indent=2) + '\n')
             print(json.dumps({'event': 'native_backup', 'run': str(root), **record}), flush=True)
         except Exception as exc:
-            print(json.dumps({'event': 'native_backup_failed', 'run': str(root), 'error_type': type(exc).__name__}), flush=True)
+            print(json.dumps({'event': 'native_backup_failed', 'run': str(root), **attribution,
+                              'error_type': type(exc).__name__}), flush=True)
+
+
+async def main(series, interval):
+    client = AsyncSandboxClient(api_key=json.loads((Path.home() / '.prime/config.json').read_text())['api_key'])
+
+    async def capture(item):
+        root = Path(item['out'])
+        try:
+            manifest = json.loads((root / 'manifest.json').read_text())
+            if manifest['status'] in ('launching', 'running'):
+                await capture_run(client, root)
+        except Exception as exc:
+            print(json.dumps({'event': 'native_backup_failed', 'run': str(root),
+                              'error_type': type(exc).__name__}), flush=True)
 
     while True:
         plan = json.loads(series.read_text())

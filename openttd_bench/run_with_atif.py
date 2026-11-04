@@ -1,7 +1,7 @@
 """Run an evaluation, then convert its completed artifacts even on nonzero exit.
 
-Usage: python -m openttd_bench.run_with_atif outputs/RUN -- eval @ config.toml ...
-The eval command must write to the same output directory.
+Usage: python -m openttd_bench.run_with_atif outputs/RUN -- vf-run @ config.toml ...
+Use --output-dir outputs/RUN --run.dir vf; traces are collected recursively.
 """
 from __future__ import annotations
 

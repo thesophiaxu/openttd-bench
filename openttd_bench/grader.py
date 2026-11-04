@@ -12,6 +12,17 @@ def measurements_from_snapshot(snapshot: dict[str, Any]) -> dict[int, Measuremen
     return {int(company): dict(row) for company, row in snapshot.get("companies", {}).items()}
 
 
+def check_scorable(spec: TaskSpec, snapshot: dict[str, Any]) -> None:
+    """Refuse a snapshot that is the control plane's stale fallback or does not cover exactly
+    the configured companies: scoring it would silently rank the wrong numbers."""
+    if (snapshot.get("accounting_snapshot") or {}).get("fresh") is not True:
+        raise ValueError(f"snapshot is stale: {snapshot.get('accounting_snapshot')}")
+    found = set(snapshot.get("companies") or {})
+    expected = {str(c) for c in range(len(spec.companies))}
+    if found != expected:
+        raise ValueError(f"snapshot covers companies {sorted(found)}, expected {sorted(expected)}")
+
+
 def score(spec: TaskSpec, snapshot: dict[str, Any], company: int) -> Outcome:
     all_measurements = measurements_from_snapshot(snapshot)
     all_measurements.setdefault(company, {})
@@ -45,4 +56,4 @@ def metrics(spec: TaskSpec, snapshot: dict[str, Any], company: int, outcome: Out
     return out
 
 
-__all__ = ["measurements_from_snapshot", "metrics", "score"]
+__all__ = ["check_scorable", "measurements_from_snapshot", "metrics", "score"]

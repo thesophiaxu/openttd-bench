@@ -2,16 +2,34 @@
 
 Code for [OpenTTD-Bench](https://openttd-bench.pages.dev). See blogpost for implementation details, caveats, and raw trajectory data.
 
+## Runtime topology
+
+The supported upstream snapshot is **PrimeIntellect-ai/verifiers commit
+`540f40faab8c376b85c6afa2f872683b0ed1d4d1`**.
+New runs are **Prime-only**: one server VM plus one distinct VM per agent role,
+managed by the environment's `ServicesSpec`. Each agent runs as root with home
+`/root` and runtime workdir `/work`; isolation is by VM, not Unix user.
+The private LAN is **all-to-all**, not a firewall boundary. The server enforces
+company-token authorization; each agent receives only its own token. Server/admin
+secrets stay on the server. Do not expose unauthenticated services or secrets on
+an agent's LAN interface.
+
+`[env.server]` is a `vf.PrimeConfig` owning the server image/resources. Role
+`runtime` configs default to `python:3.12-slim-bookworm`, 1 CPU, 2 GB RAM,
+5 GB disk, workdir `/work`. The migrated game configs give the server the old
+shared-box resources (4 CPU, 8 GB RAM, 20 GB disk), preserving game rules and
+model/harness budgets. `env.taskset.image`, `push`, and `runtime.vm` are obsolete.
+Docker multi-agent execution and same-box probes explicitly fail; no local
+Docker fallback is supported. Prime VM charges apply even with OAuth inference.
+
 ## Reproduction
 
 ```sh
-uv venv .venv && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[dev]"
+uv sync --extra dev --frozen                  # honors the upstream Git pin
 set -a; . ./.env; set +a                       # PRIME_TEAM_ID for team billing
-scripts/with_docker.sh 'docker build -f image/Dockerfile -t openttd-bench:v3 .'
 
-# unit tests (docker-free), then the docker seat-concurrency test
-.venv/bin/python -m pytest tests --ignore=tests/test_seats.py
-scripts/with_docker.sh '.venv/bin/python -m pytest tests/test_seats.py'
+# Local unit tests: no provisioning or inference.
+PYTHONPATH=$PWD:$PWD/harnesses .venv/bin/python -m pytest tests
 
 # real-time 10-year game (one episode; ~3 h wall at 0.75x, ~8 h at 0.25x): the launcher sets
 # the idle timeout (12 h), the per-seat output-token fuse (6M: it counts reasoning tokens) and
@@ -20,10 +38,37 @@ scripts/with_docker.sh '.venv/bin/python -m pytest tests/test_seats.py'
 CONFIG=<config_file> scripts/run_ffa_realtime_10y.sh outputs/prime-ffa-realtime-10y-promptv2-4opus55
 
 # follow a long run: ntfy start/heartbeat/per-episode/finish notices
-.venv/bin/python scripts/watch_run.py outputs/<run> --topic <ntfy topic> --pid <eval pid> --heartbeat 30 --progress outputs/progress
+.venv/bin/python scripts/watch_run.py outputs/<run> --topic <ntfy topic> --pid <run pid> --heartbeat 30 --progress outputs/progress
 ```
 
-By default, inference is billed through Prime Intellect, and only Claude Code, Codex, and OpenCode are supported; ask your coding agent to create adapters.
+Launchers invoke `vf-run @ CONFIG --output-dir OUT --run.dir vf` through
+`openttd_bench.run_with_atif`. Verifiers artifacts land in `OUT/vf`; native
+captures use `OUT/raw/codex/<trace.id>` and the viewer still reads
+`OUT/trajectories/index.json`. Historical agentN captures remain readable.
+
+By default, inference is billed through Prime Intellect. Custom `claude`,
+`codex-prime`, `codex-cli` (ChatGPT OAuth), and `opencode-cli` (pinned fork)
+harnesses retain their existing authentication and telemetry. `opencode` now
+names the upstream harness; use `opencode-cli` for the historical benchmark fork.
+Other upstream harnesses, including `bash`, can use the installed `ottd` client.
+
+### Short paid acceptance test
+
+This provisions three Prime VMs and runs two DeepSeek V4.1 Flash 1017 agents.
+It exercises connectivity and isolation, not transport-building performance.
+
+```sh
+export PYTHONPATH=$PWD:$PWD/harnesses
+OUT=$PWD/outputs/multisandbox-smoke
+.venv/bin/python -m openttd_bench.run_with_atif "$OUT" -- \
+  .venv/bin/vf-run @ configs/prime/sandbox-smoke-deepseek-v41-flash-1017.toml \
+  -n 1 -r 1 -c 1 --output-dir "$OUT" --run.dir vf \
+  --env.taskset.save-dir "$OUT/saves"
+.venv/bin/python scripts/verify_multisandbox_run.py "$OUT"
+```
+
+The verifier checks distinct VMs, real model/tool activity, shared final state,
+scoring, saved trajectories, and provider-confirmed VM/LAN teardown.
 
 ### Configs used in blogpost
 

@@ -3,7 +3,10 @@ name = "openttd-bench"
 version = "3.0.0"
 description = "OpenTTD bench v3: a multi-agent-by-default OpenTTD benchmark for LLM coding agents on the verifiers framework."
 requires-python = ">=3.11,<3.14"
-dependencies = ["verifiers>=0.3.1", "pydantic>=2"]
+dependencies = ["verifiers>=0.4.0", "pydantic>=2"]
+
+[tool.uv.sources]
+verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "540f40faab8c376b85c6afa2f872683b0ed1d4d1" }
 
 [project.optional-dependencies]
 dev = ["pytest", "fastapi", "uvicorn", "httpx"]
@@ -14,6 +17,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["openttd_bench", "harnesses/openttd_seat", "harnesses/opencode", "harnesses/claude", "harnesses/codex_cli", "harnesses/codex_prime"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"image" = "openttd_bench/_image"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,4 +1,4 @@
-"""Codex CLI with intercepted API billing and the benchmark's Unix-seat isolation.
+"""Codex CLI with intercepted API billing in an isolated agent VM.
 
 Unlike codex-cli, this never reads/copies ChatGPT OAuth credentials. The seat gets
 only its ephemeral interception token; Prime authentication stays on the host.
@@ -20,9 +20,6 @@ class CodexPrimeHarnessConfig(CodexCliHarnessConfig):
 
 class CodexPrimeHarness(CodexCliHarness):
     USES_OAUTH = False
-
-    def __init__(self, config: CodexPrimeHarnessConfig) -> None:
-        super().__init__(config)
 
     def seat_files(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, bytes]:
         if self.config.model is not None and self.config.model != ctx.model:
@@ -49,9 +46,6 @@ class CodexPrimeHarness(CodexCliHarness):
 
     def seat_env(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, str]:
         return {**super().seat_env(ctx, paths, endpoint, secret), "OPENAI_API_KEY": secret}
-
-    def seat_script(self, paths: SeatPaths) -> str:
-        return super().seat_script(paths)
 
 
 __all__ = ["CodexPrimeHarness", "CodexPrimeHarnessConfig"]

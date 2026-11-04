@@ -167,3 +167,42 @@ def test_missing_codex_harvest_is_not_silently_empty(tmp_path):
     dump(tmp_path / "traces.jsonl", [trace])
     with pytest.raises(ValueError, match="Missing/ambiguous"):
         convert_run(tmp_path)
+
+
+@pytest.mark.parametrize("harvest", [None, "/gone/outputs/old/raw/codex/trace-a"])
+def test_trace_id_captures_are_distinct_for_root_roles(tmp_path, harvest):
+    traces = []
+    for tid, seat in [('trace-a', 'agent1'), ('trace-b', 'root')]:
+        trace = {'id': tid, 'agent': {'config': {'harness': {'id': 'codex-cli'}}},
+                 'info': {'seat_user': seat}, 'nodes': []}
+        if harvest:
+            trace['info']['harness_session'] = {'harvested_to': harvest if tid == 'trace-a' else '/gone/trace-b'}
+        traces.append(trace)
+        dump(tmp_path / 'raw/codex' / tid / 'sessions/session.jsonl', native(tid + '-native'))
+    # A historical seat directory must not override a trace-ID capture.
+    dump(tmp_path / 'raw/codex/agent1/sessions/session.jsonl', native('historical'))
+    dump(tmp_path / 'vf/traces.jsonl', [{'id': 'episode', 'traces': traces}])
+    manifest = convert_run(tmp_path)
+    assert {e['trajectory_id'] for e in manifest['trajectories']} == {'trace-a-native', 'trace-b-native'}
+    for entry in manifest['trajectories']:
+        doc = json.loads((tmp_path / 'trajectories' / entry['file']).read_text())
+        original = doc['extra']['prime_source']['trace']
+        assert original in traces
+
+
+def test_historical_agent_directory_fallback_remains_readable(tmp_path):
+    trace = {'id': 'legacy', 'agent': {'config': {'harness': {'id': 'codex-cli'}}},
+             'info': {'seat_user': 'agent1'}, 'nodes': []}
+    dump(tmp_path / 'traces.jsonl', [trace])
+    dump(tmp_path / 'raw/codex/agent1/sessions/session.jsonl', native('old'))
+    assert convert_run(tmp_path)['trajectories'][0]['trajectory_id'] == 'old'
+
+
+def test_root_without_matching_trace_cannot_borrow_other_role_capture(tmp_path):
+    trace = {'id': 'missing', 'agent': {'config': {'harness': {'id': 'codex-cli'}}},
+             'info': {'seat_user': 'root'}, 'nodes': []}
+    dump(tmp_path / 'vf/traces.jsonl', [trace])
+    dump(tmp_path / 'raw/codex/other/sessions/session.jsonl', native('other'))
+    dump(tmp_path / 'raw/codex/root/sessions/session.jsonl', native('ambiguous-root'))
+    with pytest.raises(ValueError, match='Missing/ambiguous'):
+        convert_run(tmp_path)

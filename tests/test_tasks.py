@@ -18,7 +18,7 @@ CARGO_LINE = re.compile(r"^  ([A-Z_]{4}) \(id (\d+)\): (.+)$", re.M)
 
 
 def test_registry_names_modules_and_configs_agree():
-    assert set(EXPERIMENTS) == {"two_towns_rail", "versus_ai_rail", "free_for_all", "mixed_hogex_realtime_10y"}
+    assert set(EXPERIMENTS) == {"two_towns_rail", "versus_ai_rail", "free_for_all", "mixed_hogex_realtime_10y", "sandbox_smoke"}
     for name, module in EXPERIMENTS.items():
         assert module.NAME == name and module.__name__.rsplit(".", 1)[-1] == name
         assert module.spec(SEEDS[0]).name == f"{name}-s{SEEDS[0]}"
@@ -43,7 +43,7 @@ CONFIG_PARAMS = sorted(
 )
 
 
-@pytest.mark.parametrize(("name", "params"), CONFIG_PARAMS)
+@pytest.mark.parametrize(("name", "params"), [(n, p) for n, p in CONFIG_PARAMS if n != "sandbox_smoke"])
 def test_seat_prompts_match_their_own_spec(name, params):
     module = experiment(name)
     params = {k: list(v) if isinstance(v, tuple) else v for k, v in params}
@@ -87,6 +87,17 @@ def test_seat_prompts_match_their_own_spec(name, params):
         for term in spec.objective:
             if term.target is not None:
                 assert f"{int(term.target):,}" in flat
+
+
+def test_smoke_scenario_is_a_short_two_agent_acceptance_test():
+    spec = experiment("sandbox_smoke").spec(101)
+    assert spec.llm_seats == 2 and len(spec.companies) == 2
+    assert spec.rules.duration_years == 1 and spec.rules.game_speed_percent == 400
+    assert spec.rules.clock == "paused"
+    for company in spec.companies:
+        assert "not playing a full game" in company.prompt
+        assert "api/admin/snapshot" in company.prompt and "status 403" in company.prompt
+        assert "Do not print or inspect credentials" in company.prompt
 
 
 def test_experiment_specifics():

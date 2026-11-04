@@ -1,14 +1,26 @@
 # openttd-bench v3
 
-A multi-agent-by-default OpenTTD benchmark for LLM coding agents, built on the Prime
-Intellect **verifiers** framework (0.3.1).
+A multi-agent-by-default OpenTTD benchmark for LLM coding agents.
 
-Per episode: **one sandbox** (docker container or Prime VM). The pinned OpenTTD 15.3
-dedicated server and an HTTP control plane run as root; each agent seat runs as its own
-Unix user (`agent1..agent4`); the control plane is the authorization boundary (bearer
-token → company). Agents use a CLI (`ottd`) and a Python library (`openttd_client`)
-built on goal-free lookup/build primitives. All goal logic lives in Python outside the
-game; the injected GameScript never knows the goal.
+The supported upstream snapshot is **PrimeIntellect-ai/verifiers commit
+`540f40faab8c376b85c6afa2f872683b0ed1d4d1`**.
+New runs are **Prime-only**: one server VM plus one distinct VM per agent role,
+managed by the environment's `ServicesSpec`. Each agent runs as root with home
+`/root` and runtime workdir `/work`; isolation is by VM, not Unix user.
+The private LAN is **all-to-all**, not a firewall boundary. Bearer-token company
+authorization and server/admin secrets remain on the server; do not expose
+unauthenticated services or secrets on an agent's LAN interface.
+
+`[env.server]` is a `vf.PrimeConfig` owning the server image/resources. Role
+`runtime` configs default to `python:3.12-slim-bookworm`, 1 CPU, 2 GB RAM,
+5 GB disk, workdir `/work`. The migrated game configs give the server the old
+shared-box resources (4 CPU, 8 GB RAM, 20 GB disk), preserving game rules and
+model/harness budgets. `env.taskset.image`, `push`, and `runtime.vm` are obsolete.
+Docker multi-agent execution and same-box probes explicitly fail; no local
+Docker fallback is supported. Prime VM charges apply even with OAuth inference.
+
+Agents use `ottd` and `openttd_client` goal-free primitives. All goal logic lives
+in Python outside the game; the injected GameScript never knows the goal.
 
 | Task | Seats | Opponents | Map | Modes | Objective | Horizon |
 |---|---|---|---|---|---|---|
@@ -28,14 +40,14 @@ headline configs set `llm_seats = 2`, `hogex_seats = 2`, `starting_cash = 800_00
 ```
 openttd_bench/   task_spec (the schema: world/grading split), objectives, tasks/ (one file per
                  experiment holding its world, grading and literal prompt; tasks_shared.py has the
-                 cargo tables and helpers), env (per-seat runtime views), taskset, grader, payload
+                 cargo tables and helpers), env (server + distinct role VMs), taskset, grader, payload
                  builder, schema/ (the one command schema)
-harnesses/       source root for seat harnesses: openttd_seat/ (the shared seat layer: user, home,
-                 setpriv demotion, trace keys), opencode/ and claude/ (one program each)
+harnesses/       source root for seat harnesses: openttd_seat/ (root home, workdir,
+                 trace metadata), codex_cli/, opencode/ and claude/
 image/           everything that runs in the sandbox: init_game.py (sequential boot), patch_speed.py,
                  fetch_content.py, server/ (control plane), client/ (agent library + ottd CLI),
                  game/LLMEval (deity GameScript, namespaced), ai/LLMCompany (order-relay AI), Dockerfile
-configs/         run configs: docker (local) and prime/ (Prime VM, stock image bootstraps content)
+configs/         Prime-only run configs (stock images bootstrap content)
 tests/           unit tests (barrier, policy, schema/spec, contracts, seats) + tests/stress/rig.py
 scripts/         run_ffa_realtime_10y.sh / run_ffa_realtime_10y_docker.sh (FFA launchers),
                  run_model_series.py + run_ledger_episode_monitored.sh (scheduled ledger series
@@ -52,19 +64,16 @@ outputs/         active runs (native results + `trajectories/` ATIF), `archived/
 ```sh
 uv venv .venv && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[dev]"
 set -a; . ./.env; set +a                       # PRIME_TEAM_ID for team billing
-scripts/with_docker.sh 'docker build -f image/Dockerfile -t openttd-bench:v3 .'
 
-# unit tests (docker-free), then the docker seat-concurrency test
+# Local unit tests: no provisioning or inference.
 .venv/bin/python -m pytest tests --ignore=tests/test_seats.py
-scripts/with_docker.sh '.venv/bin/python -m pytest tests/test_seats.py'
 
 # real-time 10-year free-for-all (~3 h wall, one episode): the launcher sets the idle
 # timeout, the per-seat output-token fuse (6M: it counts reasoning tokens) and PYTHONPATH
 CONFIG=configs/prime/free-for-all-realtime-10y-promptv2-4opus55.toml scripts/run_ffa_realtime_10y.sh outputs/prime-ffa-realtime-10y-promptv2-4opus55  # Prime
-CONFIG=configs/free-for-all-realtime-10y-promptv2-4codex.toml scripts/run_ffa_realtime_10y_docker.sh outputs/docker-ffa-realtime-10y-promptv2-4codex  # local docker
 
 # follow a long run: ntfy start/heartbeat/per-episode/finish notices
-.venv/bin/python scripts/watch_run.py outputs/<run> --topic <ntfy topic> --pid <eval pid> --heartbeat 30 --progress outputs/progress
+.venv/bin/python scripts/watch_run.py outputs/<run> --topic <ntfy topic> --pid <run pid> --heartbeat 30 --progress outputs/progress
 ```
 
 Inference is billed to the Prime team wallet (`prime wallet`), not OpenRouter: budget ~$75 per
@@ -73,19 +82,28 @@ real-time task died on an empty wallet (HTTP 402) — check the balance first.
 
 ## How an episode runs
 
-1. `OpenTTDEnv.run` provisions one box from seat `p1`'s runtime policy (retries get a fresh
-   world), uploads the payload (`image/` + generated `schema.json`, cargo table, `world.json`,
-   `seats.json`), and starts `init_game.py` in the background.
-2. `init_game` (root, sequential): acquire pinned content if missing (a stock image bootstraps
-   itself), speed-patch the binary, write `openttd.cfg`, stage the scripts, launch the server,
-   start the control plane, pause, `configure` the GameScript, verify the cargo table, found
-   towns, seat companies (LLM seats first), fund them, write per-user seat files, mark boot
-   complete.
-3. Every LLM seat runs concurrently in the same box through a `SeatRuntime` view (its own
-   env + borrow lock), its harness demoting to `agentN`. Seats retire on finish.
-4. The env runs the clock out to the horizon, takes the grading snapshot (control-plane
-   accumulator + GameScript company measurements + economy mirror), captures the terminal
-   save, and `finalize` scores every seat with `openttd_bench.grader`.
+1. `OpenTTDEnv.run` owns the deployment and `ServicesSpec`: a server VM from
+   `env.server`, and N distinct Prime agent VMs from the role runtime configs.
+   Retries get a fresh world; all VMs join the same private LAN.
+2. The server receives the payload (`image/`, generated schema/cargo tables,
+   `world.json`, `seats.json`). Its root bootstrap acquires pinned content,
+   starts OpenTTD and the control plane, configures/funds companies, and marks
+   the world ready. Server/admin secrets never go into agent bootstrap payloads.
+3. Each role receives only its own company credential and client payload.
+   Harnesses run concurrently as root in their own VMs, home `/root`, configured
+   runtime workdir (default `/work`). Roles retire independently.
+4. The env runs out the clock, grades the server snapshot, and captures the
+   terminal save; deployment cleanup closes all owned VMs.
+
+The env writes credential-free runtime inventory to
+`$OPENTTD_RUN_DIR/live/runtimes/<server_backend.name>.json` on startup, trace mint,
+and retirement. It contains `server: {sandbox_id, status}`,
+`agents: {role: {company, sandbox_id, trace_id|null, home: "/root", workdir, status}}`,
+`spec`, and `task_idx`. Statuses are `booting`, `running`, `stopped`, `closed`.
+Collectors use these explicit role VM IDs, never the last sandbox ID in a log.
+Error/activity output retains historical `seats` keys and `agentN-errors.jsonl`
+filenames for watchers, adding role/company/trace/VM attribution.
+Native backups include each active role, not just company 1.
 
 While the seats play, the env appends a progress line (game date, per-company profit,
 vehicles, stations) every `progress_seconds` (default 600) to
@@ -109,15 +127,12 @@ one to ntfy every N minutes.
 A harness is the program that plays a seat. `harnesses/` is a source root (verifiers loads a
 harness by top-level module name, so each one is its own package there; `pyproject.toml` lists
 them and `tests/conftest.py` / the launchers put `harnesses/` on the path for uninstalled runs).
-`openttd_seat.SeatHarness` owns everything a seat needs regardless of program: the Unix user
-from `OPENTTD_SEAT_USER`, the `/home/<user>{,/work,/task-prompt.md}` layout, the root-run
-`mkdir/chown/chmod 700` preparation after the harness's files are written, the `setpriv`
-demotion, and the trace keys `seat_user`, `harness_output_tail`, `harness_session`. A harness
-adds `setup` (root-installed, lock-guarded binary), `seat_files` (config to write into the
-home), `seat_env` (variables exported in the demoted shell), `seat_script` (the program line)
-and optionally `session_summary` (its own session store → turns/tokens/tool calls in the trace).
+`openttd_seat.SeatHarness` prepares an isolated VM's root home and configured
+runtime workdir. There is no `agentN` account or `setpriv` demotion for new runs.
+The trace retains `harness_output_tail` and `harness_session`; native Codex
+captures are keyed by trace ID, not the common root username.
 
-- `opencode` — pinned `PrimeIntellect-ai/opencode` fork, `opencode run` on the prompt, provider
+- `opencode-cli` — pinned `PrimeIntellect-ai/opencode` fork, `opencode run` on the prompt, provider
   JSON pointing at the interception endpoint (OpenAI-compatible dialect).
 - `claude` — `@anthropic-ai/claude-code` via npm, `claude -p` on the prompt with
   `ANTHROPIC_BASE_URL` at the interception endpoint (Anthropic Messages dialect, which the
@@ -128,20 +143,14 @@ Switching is config-only: `configs/prime/free-for-all-realtime-10y-promptv2-4opu
 all four seats with Claude Code on Opus 5.5, and `configs/prime/free-for-all-realtime-10y-4models.toml`
 gives each seat its own `model` (`[env.pN] model = ...`).
 
-`traces.jsonl` is written only when the episode ends. While a run is live, the programs' own
-session stores are the way to see what a seat is doing: opencode under
-`~agentN/.local/share/opencode/storage/{message,part}`, Claude Code under
-`~agentN/.claude/projects/<slug>/*.jsonl` (subagents under `subagents/`). Read them with
-`prime sandbox run <id> -- python3 ...`, or pull them out with `prime sandbox download <id>
-<remote> <local>` (tar them in the box first; base64 over `sandbox run` output gets the CLI
-banner mixed in). After the run, `harness_session` in each trace carries the counts.
-
-Stopping inference mid-game is a cost lever that keeps the score: kill the seats' programs in
-the box (`claude` / `opencode` processes owned by `agentN`) after saving via
-`POST /api/admin/save` with the admin token from `/opt/openttd/seats.json`. The harnesses
-return exit 143 (traces show `stop=error`), the env retires the seats, runs the clock out to
-the horizon at sandbox cost only, and scores the world as it stands. The Opus 5 run below was
-stopped this way at 1955.
+`traces.jsonl` is written when an episode ends. During a run, use the explicit
+role VM IDs in the inventory to inspect native stores: root's
+`.local/share/opencode/storage`, `.claude/projects`, or `.codex/sessions`.
+`scripts/collect_codex_live_errors.py` reads only native error events and tool
+activity counts; `scripts/snapshot_codex_live.py` backs up native JSONL stores
+without auth/config files. Credential access in runtime launch/probe scripts
+happens only when explicitly executed, never as part of offline validation.
+Do not use the historical same-box isolation probe for these VMs.
 
 ## Current accounting (`company-quarterly-v1`)
 
@@ -188,16 +197,16 @@ seat has yet reached a RailwAI winner.
 
 ## ATIF trajectories
 
-The FFA launchers run evaluations through `openttd_bench.run_with_atif`. After eval
+The launchers run `vf-run` through `openttd_bench.run_with_atif`. After the runner
 exits (including nonzero exits), it converts the completed artifacts into
 `outputs/<run>/trajectories/`. The wrapper forwards termination signals, preserves
-an eval failure's exit status, and returns nonzero if conversion fails. SIGKILL or
-host failure requires a manual backfill. Direct `eval` invocations must use the
+the runner's failure exit status, and returns nonzero if conversion fails. SIGKILL or
+host failure requires a manual backfill. Direct `vf-run` invocations must use the
 wrapper for automatic conversion:
 
 ```sh
 .venv/bin/python -m openttd_bench.run_with_atif outputs/my-run -- \
-  .venv/bin/eval @ configs/prime/free-for-all-realtime-10y-promptv2-4opus55.toml --output-dir outputs/my-run --no-serve
+  .venv/bin/vf-run @ configs/prime/free-for-all-realtime-10y-promptv2-4opus55.toml --output-dir outputs/my-run --run.dir vf
 
 # Backfill Prime traces and/or the Codex harvest referenced by each seat:
 .venv/bin/python -m openttd_bench.atif outputs/my-run
@@ -227,10 +236,11 @@ conflicting snapshots, and malformed JSON fail visibly instead of producing empt
 conversations.
 
 The wrapper sets `OPENTTD_RUN_DIR`, so new Codex harvests go under the run's
-`raw/codex/` before the sandbox disappears. For existing runs the converter follows
+`raw/codex/<trace.id>` before the VM disappears; verifiers traces live under `vf/`. For existing runs the converter follows
 `harness_session.harvested_to`, also checking relocated `raw/codex/<harvest-name>`
-and `outputs/archived/` paths. The crash-safe `scripts/harvest_codex.sh` can still
-be used independently; supply its finished seat tree with `--codex-dir` if needed.
+and `outputs/archived/` paths. Without that pointer it prefers trace-ID captures,
+then historical `agentN` trees. Legacy Docker harvest trees can still be supplied
+with `--codex-dir`, but the Docker harvester itself now explicitly errors.
 
 ## Viewer
 
@@ -257,8 +267,8 @@ listens on the tailnet address for the served port, and Node's default `::` bind
   RailwAI. Wall-clock cost is ~0.1–0.3 s per ticket.
 - **GameScript readiness** is a control-plane `ping`, not a push (the push is lost if the
   script starts before the admin connects).
-- **Seat concurrency** uses per-seat runtime views instead of a verifiers patch (the
-  framework serializes borrowers of one runtime to protect the runtime-wide env).
+- **Seat concurrency** uses distinct role VMs; VM separation replaces historical
+  per-user runtime views and shared-box locks.
 - **Terminal save parsing** (OpenTTDLab) is not wired: no launch meter needs it; the save is
   captured as an audit artifact under `outputs/saves/`.
 

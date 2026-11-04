@@ -12,7 +12,7 @@ from types import ModuleType
 from typing import Any, Protocol
 
 from openttd_bench.task_spec import TaskSpec
-from openttd_bench.tasks import free_for_all, mixed_hogex_realtime_10y, two_towns_rail, versus_ai_rail
+from openttd_bench.tasks import free_for_all, mixed_hogex_realtime_10y, sandbox_smoke, two_towns_rail, versus_ai_rail
 
 
 class Experiment(Protocol):
@@ -25,7 +25,7 @@ class Experiment(Protocol):
 
 EXPERIMENTS: dict[str, ModuleType] = {
     module.NAME: module
-    for module in (two_towns_rail, versus_ai_rail, free_for_all, mixed_hogex_realtime_10y)
+    for module in (two_towns_rail, versus_ai_rail, free_for_all, mixed_hogex_realtime_10y, sandbox_smoke)
 }
 
 
@@ -45,4 +45,5 @@ __all__ = [
     "mixed_hogex_realtime_10y",
     "two_towns_rail",
     "versus_ai_rail",
+    "sandbox_smoke",
 ]

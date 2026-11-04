@@ -1,10 +1,4 @@
-"""The shared seat layer (harnesses/openttd_seat) and the two harnesses built on it.
-
-What every harness gets for free: the seat user from OPENTTD_SEAT_USER, the home layout,
-the root-run home preparation after the files are written, the setpriv demotion, the
-harness env passed through, and the standard trace keys. What each harness adds: its
-files, its exported variables, and the program line.
-"""
+"""CLI harnesses use the isolated VM directly; cleanup owns native diagnostics."""
 
 from __future__ import annotations
 
@@ -14,44 +8,32 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from verifiers.v1 import DockerConfig, ModelContext, ProgramResult, Runtime, TaskData
+from verifiers.v1 import ModelContext, ProgramResult, Runtime, TaskData
 from verifiers.v1.clients import EvalClientConfig
 
 from claude.harness import ClaudeHarness, ClaudeHarnessConfig
 from opencode.harness import OpenCodeHarness, OpenCodeHarnessConfig
-from openttd_bench.seats import SeatRuntime
-from openttd_seat import SeatConfig, SeatHarness, demoted, seat_paths
-from openttd_seat.seat import SEAT_USER_ENV
+from openttd_seat import SeatConfig, SeatHarness, seat_paths
 
 
-class FakeBox(Runtime):
-    is_local = True
+class FakeBox:
+    """Duck recorder: upstream Runtime is an immutable backend binding."""
 
-    def __init__(self, summary: dict | None = None) -> None:
-        super().__init__(name="fake")
-        self.config = DockerConfig(image="x")
-        self.info = self.config.model_copy()  # type: ignore[assignment]
-        self.calls: list[tuple[list[str], dict[str, str]]] = []
-        self.files: dict[str, bytes] = {}
-        self.order: list[str] = []
-        self.summary = summary
-
-    async def start(self) -> None:
-        pass
+    def __init__(self, summary=None, home=None, workdir=None):
+        self.home = home
+        self.config = SimpleNamespace(workdir=workdir)
+        self.calls = []
+        self.files = {}
+        self.summary = {} if summary is None else summary
 
     async def run(self, argv, env):
         self.calls.append((argv, env))
-        self.order.append("run:" + argv[0])
-        if argv[:2] == ["python3", "-c"] and self.summary is not None:
+        if argv[:2] == ["python3", "-c"]:
             return ProgramResult(0, json.dumps(self.summary), "")
         return ProgramResult(0, "program output", "")
 
-    async def _read(self, path):
-        return self.files[path]
-
     async def write(self, path, data):
         self.files[path] = data
-        self.order.append("write:" + path)
 
 
 class EchoConfig(SeatConfig):
@@ -59,143 +41,178 @@ class EchoConfig(SeatConfig):
 
 
 class EchoHarness(SeatHarness[EchoConfig]):
-    """The smallest harness: one file, one variable, one line."""
-
     def seat_files(self, ctx, paths, endpoint, secret):
         return {f"{paths.home}/.echo/config": f"{endpoint} {secret}".encode()}
 
     def seat_env(self, ctx, paths, endpoint, secret):
-        return {"ECHO_MODEL": ctx.model}
+        return {"ECHO_MODEL": ctx.model, "MODEL_TOKEN": secret}
 
     def seat_script(self, paths):
         return f"cat {paths.prompt_file}"
 
 
-def seat_view(box: Runtime, role: str, user: str) -> SeatRuntime:
-    view = SeatRuntime(box, role)
-    view.env = {
-        "OPENTTD_API_URL": "http://127.0.0.1:20003",
-        "OPENTTD_SEAT": "2",
-        SEAT_USER_ENV: user,
-    }
-    return view
-
-
-def launch(harness, box, user="agent3", model="moonshotai/kimi-k3", endpoint="http://127.0.0.1:5555/v1"):
+def launch(harness, box, model="moonshotai/kimi-k3", endpoint="http://127.0.0.1:5555/v1", cleanup=True):
     ctx = ModelContext(model=model, client=EvalClientConfig())
-    trace = SimpleNamespace(info={})
+    trace = SimpleNamespace(id="trace-123", info={})
     data = TaskData(prompt="go build", image="x", workdir="/work")
-    result = asyncio.run(harness.launch(ctx, trace, seat_view(box, "p3", user), endpoint, "s3cret", {}, data))
-    return result, trace
+
+    async def run():
+        try:
+            return await harness.launch(ctx, trace, box, endpoint, "s3cret", {}, data)
+        finally:
+            if cleanup:
+                await harness.cleanup(trace, box)
+
+    return asyncio.run(run()), trace
 
 
-def test_helpers():
-    assert seat_paths("agent2").home == "/home/agent2"
-    assert seat_paths("agent2").workdir == "/home/agent2/work"
-    assert seat_paths("agent2").prompt_file == "/home/agent2/task-prompt.md"
-    assert demoted("agent2", ["sh", "-c", "id"]) == [
-        "setpriv",
-        "--reuid=agent2",
-        "--regid=agent2",
-        "--init-groups",
-        "sh",
-        "-c",
-        "id",
-    ]
+def test_helpers_and_runtime_paths():
+    assert seat_paths().home == "/root"
+    assert seat_paths().workdir == "/work"
+    assert seat_paths().prompt_file == "/root/task-prompt.md"
+    assert "user" not in SeatConfig.model_fields
+    harness = EchoHarness(EchoConfig(id="echo"))
+    paths = harness.paths_for(FakeBox(home="/custom home", workdir="/workspace"))
+    assert paths.home == "/custom home" and paths.workdir == "/workspace"
 
 
-def test_seat_layer_writes_then_prepares_then_demotes():
+def test_launch_writes_then_runs_root_without_sourcing_credentials():
     box = FakeBox()
     harness = EchoHarness(EchoConfig(id="echo", env={"EXTRA": "1"}))
-    result, trace = launch(harness, box)
-    # Files land before the root-run preparation that hands the home to the seat user.
-    assert box.files["/home/agent3/task-prompt.md"] == b"go build"
-    assert box.files["/home/agent3/.echo/config"] == b"http://127.0.0.1:5555/v1 s3cret"
-    prep_index = box.order.index("run:sh")
-    assert all(box.order.index(f"write:{p}") < prep_index for p in box.files)
-    prep_argv, _ = box.calls[0]
-    assert "mkdir -p /home/agent3/.echo /home/agent3/work" in prep_argv[2]
-    assert "chown -R agent3:agent3 /home/agent3" in prep_argv[2] and "chmod 700 /home/agent3" in prep_argv[2]
-    # The program runs demoted, with HOME plus the harness variables exported and the seat env kept.
-    # The exports live in a 0600 file the demoted shell sources, never on argv.
-    assert box.files["/home/agent3/.seat_env"] == b'export HOME="/home/agent3"\nexport ECHO_MODEL="moonshotai/kimi-k3"\n'
-    assert box.order.index("write:/home/agent3/.seat_env") < prep_index
-    assert "chmod 600 /home/agent3/.seat_env" in prep_argv[2]
-    argv, env = box.calls[1]
-    assert argv[:4] == ["setpriv", "--reuid=agent3", "--regid=agent3", "--init-groups"]
-    assert argv[4:6] == ["bash", "-c"]
-    assert argv[6].startswith(
-        "set -a; . /home/agent3/.openttd_seat || exit 97; set +a; . /home/agent3/.seat_env || exit 97; "
-    )
-    assert argv[6].endswith("cat /home/agent3/task-prompt.md")
-    assert env[SEAT_USER_ENV] == "agent3" and env["EXTRA"] == "1"
+    result, trace = launch(harness, box, cleanup=False)
+    assert box.files["/root/task-prompt.md"] == b"go build"
+    assert box.files["/root/.echo/config"] == b"http://127.0.0.1:5555/v1 s3cret"
+    assert len(box.calls) == 1
+    argv, env = box.calls[0]
+    assert argv[:2] == ["bash", "-c"]
+    assert "cat /root/task-prompt.md" in argv[2]
+    assert "mkdir -p /work" in argv[2]
+    assert env == {"EXTRA": "1", "HOME": "/root", "ECHO_MODEL": "moonshotai/kimi-k3", "MODEL_TOKEN": "s3cret"}
+    for obsolete in ("setpriv", "chown", ".seat_env", ".openttd_seat"):
+        assert obsolete not in argv[2]
+        assert not any(obsolete in p for p in box.files)
+    assert "s3cret" not in " ".join(argv)
     assert result.exit_code == 0
-    assert trace.info["seat_user"] == "agent3"
+    assert "seat_user" not in trace.info
+    assert "harness_session" not in trace.info
     assert trace.info["harness_output_tail"] == "program output"
+    asyncio.run(harness.cleanup(trace, box))
     assert trace.info["harness_session"] == {}
 
 
-def test_seat_user_falls_back_to_config():
-    box = FakeBox()
-    harness = EchoHarness(EchoConfig(id="echo", user="agent1"))
-    view = SeatRuntime(box, "p1")
-    view.env = {}
-    assert harness.paths_for(view).user == "agent1"
+def test_frozen_runtime_merges_task_env_without_mutation():
+    class Backend:
+        config = SimpleNamespace(workdir="/work")
+
+        def __init__(self):
+            self.box = FakeBox()
+
+        async def run(self, binding, argv, env):
+            return await self.box.run(argv, binding.process_env(env))
+
+        async def write(self, binding, path, data):
+            await self.box.write(path, data)
+
+    backend = Backend()
+    runtime = Runtime(backend, env={"HOME": "/root", "OPENTTD_API_URL": "http://control", "OPENTTD_SEAT": "1"})
+    launch(EchoHarness(EchoConfig(id="echo")), runtime)
+    env = backend.box.calls[0][1]
+    assert env["OPENTTD_API_URL"] == "http://control"
+    assert env["MODEL_TOKEN"] == "s3cret"
+    assert "OPENTTD_API_TOKEN" not in env
+    assert "MODEL_TOKEN" not in runtime.env
 
 
-def test_session_summary_failure_never_fails_the_launch():
+def test_session_summary_failure_is_diagnostic_and_redacted():
     class Broken(EchoHarness):
         async def session_summary(self, runtime, paths):
-            raise OSError("store missing")
+            raise OSError("secret token s3cret")
 
     result, trace = launch(Broken(EchoConfig(id="echo")), FakeBox())
     assert result.exit_code == 0
-    assert trace.info["harness_session"]["error"].startswith("OSError: store missing")
+    assert "OSError" in trace.info["harness_session"]["error"]
+    assert "s3cret" not in str(trace.info)
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_cleanup_collects_after_launch_failure(failure):
+    class FailedBox(FakeBox):
+        async def run(self, argv, env):
+            if argv[0] == "bash":
+                raise failure()
+            return await super().run(argv, env)
+
+    harness = OpenCodeHarness(OpenCodeHarnessConfig(id="opencode"))
+    box = FailedBox(summary={"store": "opencode", "tool_calls": 3})
+    trace = SimpleNamespace(id="failed-trace", info={})
+
+    async def run():
+        try:
+            with pytest.raises(failure):
+                await harness.launch(ModelContext(model="test", client=EvalClientConfig()), trace, box,
+                                     "http://proxy/v1", "secret", {}, TaskData(prompt="go", image="x"))
+        finally:
+            await harness.cleanup(trace, box)
+        await harness.cleanup(trace, box)  # idempotent
+
+    asyncio.run(run())
+    assert trace.info["harness_session"] == box.summary
+    assert len(box.calls) == 1
+
+
+def test_summary_timeout_is_diagnostic(monkeypatch):
+    from openttd_seat import seat
+
+    class Hung(EchoHarness):
+        async def session_summary(self, runtime, paths):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(seat, "CAPTURE_TIMEOUT", 0.01)
+    _, trace = launch(Hung(EchoConfig(id="echo")), FakeBox())
+    assert "TimeoutError" in trace.info["harness_session"]["error"]
 
 
 def test_opencode_files_env_script_and_summary():
-    summary = {
-        "store": "opencode",
-        "assistant_messages": 7,
-        "output_tokens": 1234,
-        "reasoning_tokens": 99,
-        "tool_calls": 5,
-        "tools": {"bash": 5},
-    }
+    summary = {"store": "opencode", "assistant_messages": 7, "output_tokens": 1234, "tool_calls": 5}
     box = FakeBox(summary=summary)
-    harness = OpenCodeHarness(OpenCodeHarnessConfig(id="opencode"))
-    _, trace = launch(harness, box)
-    config = json.loads(box.files["/home/agent3/.config/opencode/opencode.json"])
+    _, trace = launch(OpenCodeHarness(OpenCodeHarnessConfig(id="opencode")), box)
+    config = json.loads(box.files["/root/.config/opencode/opencode.json"])
     assert config["provider"]["moonshotai"]["options"]["baseURL"] == "http://127.0.0.1:5555/v1"
-    argv, _ = box.calls[1]
-    script = argv[6]
-    exports = box.files["/home/agent3/.seat_env"].decode()
-    assert 'PATH="/opt/opencode/bin:$PATH"' in exports and 'OPENCODE_DISABLE_FILETIME_CHECK="true"' in exports
-    assert script.endswith("cd /home/agent3/work && cat /home/agent3/task-prompt.md | opencode run 2>&1")
-    # The store walk runs as root on the seat home and lands in the trace.
-    summary_argv, _ = box.calls[2]
-    assert summary_argv[:2] == ["python3", "-c"] and summary_argv[3] == "/home/agent3"
+    argv, env = box.calls[0]
+    assert 'PATH="/opt/opencode/bin:$PATH"' in argv[2]
+    assert env["OPENCODE_DISABLE_FILETIME_CHECK"] == "true"
+    assert "$PATH" not in str(env)
+    assert argv[2].endswith("cd /work && cat /root/task-prompt.md | opencode run 2>&1")
+    assert box.calls[1][0][-1] == "/root"
     assert trace.info["harness_session"] == summary
-    assert "opencode_output_tail" not in trace.info  # renamed: harness_output_tail
 
 
 def test_claude_env_and_script():
     box = FakeBox(summary={"store": "claude_code"})
-    harness = ClaudeHarness(ClaudeHarnessConfig(id="claude"))
-    _, trace = launch(harness, box, model="anthropic/claude-sonnet-4.5", endpoint="http://127.0.0.1:5555/v1")
-    argv, _ = box.calls[1]
-    script = argv[6]
-    exports = box.files["/home/agent3/.seat_env"].decode()
-    assert 'ANTHROPIC_BASE_URL="http://127.0.0.1:5555"' in exports  # dialect route is <base>/v1/messages
-    assert 'ANTHROPIC_API_KEY="s3cret"' in exports and 'ANTHROPIC_MODEL="anthropic/claude-sonnet-4.5"' in exports
-    assert 'CLAUDE_CONFIG_DIR="/home/agent3/.claude"' in exports
-    assert script.endswith("claude -p --dangerously-skip-permissions --output-format text 2>&1")
-    assert "/home/agent3/.claude/.keep" in box.files
-    assert "mkdir -p /home/agent3/.claude /home/agent3/work" in box.calls[0][0][2]
+    _, trace = launch(ClaudeHarness(ClaudeHarnessConfig(id="claude")), box, model="anthropic/claude-sonnet-4.5")
+    argv, env = box.calls[0]
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:5555"
+    assert env["ANTHROPIC_API_KEY"] == "s3cret"
+    assert env["ANTHROPIC_MODEL"] == "anthropic/claude-sonnet-4.5"
+    assert env["CLAUDE_CONFIG_DIR"] == "/root/.claude"
+    assert "$PATH" not in str(env)
+    assert "s3cret" not in str(argv)
+    assert argv[2].endswith("claude -p --dangerously-skip-permissions --output-format text 2>&1")
+    assert "/root/.claude/.keep" in box.files
     assert trace.info["harness_session"] == {"store": "claude_code"}
 
 
-@pytest.mark.parametrize("harness_id, module", [("opencode", "opencode"), ("claude", "claude")])
+def test_output_tail_redacts_model_token():
+    class EchoSecret(FakeBox):
+        async def run(self, argv, env):
+            return ProgramResult(0, "s3cret" * 1000, "")
+
+    _, trace = launch(EchoHarness(EchoConfig(id="echo")), EchoSecret())
+    assert "s3cret" not in trace.info["harness_output_tail"]
+    assert len(trace.info["harness_output_tail"]) <= 3000
+
+
+@pytest.mark.parametrize("harness_id, module", [("opencode-cli", "opencode"), ("claude", "claude")])
 def test_harness_ids_load_through_verifiers(harness_id, module):
     from verifiers.v1.utils.loaders import harness_class
 
@@ -204,29 +221,18 @@ def test_harness_ids_load_through_verifiers(harness_id, module):
     assert issubclass(cls, SeatHarness)
 
 
-@pytest.mark.parametrize("harness", [
-    ClaudeHarness(ClaudeHarnessConfig(id="claude")),
-    OpenCodeHarness(OpenCodeHarnessConfig(id="opencode")),
-])
-def test_no_secret_ever_rides_argv(harness):
-    """argv is world-readable (/proc/<pid>/cmdline): the inference secret may appear neither in
-    any argv nor in the env a runtime might flatten onto argv (Prime wraps env into `sh -c`)."""
-    box = FakeBox(summary={})
-    launch(harness, box)
-    for argv, env in box.calls:
-        assert "s3cret" not in " ".join(argv) + " ".join(env.values()), argv
-    assert any(b"s3cret" in data for data in box.files.values())  # it reached the program by file
-
-
-def test_client_reads_the_seat_file_when_the_env_lacks_the_token(tmp_path, monkeypatch):
+def test_client_reads_url_and_token_from_file(tmp_path, monkeypatch):
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "image" / "client"))
     from openttd_client.transport import Transport
 
-    (tmp_path / ".openttd_seat").write_text("OPENTTD_API_URL=http://x\nOPENTTD_API_TOKEN=abc123\nOPENTTD_SEAT=1\n")
+    (tmp_path / ".openttd_seat").write_text("OPENTTD_API_URL=http://x\nOPENTTD_API_TOKEN=abc123\n")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("OPENTTD_API_URL", raising=False)
     monkeypatch.delenv("OPENTTD_API_TOKEN", raising=False)
-    assert Transport().token == "abc123"
+    transport = Transport()
+    assert transport.token == "abc123"
+    assert transport.url == "http://x"
     monkeypatch.setenv("OPENTTD_API_TOKEN", "from-env")
     assert Transport().token == "from-env"

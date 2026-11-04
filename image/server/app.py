@@ -567,7 +567,10 @@ def seat_auth(authorization: str | None = Header(default=None)) -> int:
     raise HTTPException(401, "a seat bearer token is required (OPENTTD_API_TOKEN)")
 
 
-def admin_auth(authorization: str | None = Header(default=None)) -> str:
+def admin_auth(request: Request, authorization: str | None = Header(default=None)) -> str:
+    # Uvicorn ignores forwarded headers: only processes in the server VM may administer it.
+    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "admin API is loopback-only")
     token = _bearer(authorization)
     if ADMIN_TOKEN and secrets.compare_digest(token, ADMIN_TOKEN):
         return "admin"

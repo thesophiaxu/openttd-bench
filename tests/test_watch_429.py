@@ -31,3 +31,14 @@ def test_same_request_in_other_file_is_deduplicated(tmp_path):
     b.write_text('exceeded retry limit, last status: 429 Too Many Requests, request id: r-123\n')
     assert len(scan_file(a, state, 'Sol')) == 1
     assert scan_file(b, state, 'Sol') == []
+
+
+def test_native_error_attribution_is_retained_without_message(tmp_path):
+    import json
+    path = tmp_path / 'agent1-errors.jsonl'
+    path.write_text(json.dumps({'message': 'HTTP 429 private body', 'role': 'p2', 'company': 0,
+                              'sandbox_id': 'vm-1', 'trace_id': 'trace-1'}) + '\n')
+    event, = scan_file(path, {'offsets': {}, 'seen': []}, 'mixed')
+    assert event['role'] == 'p2' and event['company'] == 0
+    assert event['sandbox_id'] == 'vm-1' and event['trace_id'] == 'trace-1'
+    assert 'private body' not in json.dumps(event)

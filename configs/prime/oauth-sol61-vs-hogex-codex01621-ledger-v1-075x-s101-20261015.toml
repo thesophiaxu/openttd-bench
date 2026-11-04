@@ -1,20 +1,26 @@
 # One LLM via Codex subscription OAuth versus one native AAAHogEx v115.
 model = "openai/gpt-6.1-sol"
-push = false
 
 [env]
 max_concurrent_agents = 1
 
+# Server owns game resources; every role has a separate root VM.
+[env.server]
+type = "prime"
+image = "python:3.12-slim-bookworm"
+cpu = 4
+memory = 8
+disk = 20
+idle_timeout = 14400
+
 [env.taskset]
 id = "openttd_bench"
 experiment = "mixed_hogex_realtime_10y"
-image = "python:3.12-slim-bookworm"
 seeds = [101]
 model = "openai/gpt-6.1-sol"
 boot_seconds = 1200
 run_out_seconds = 12000
 progress_seconds = 60
-require_model_activity = true
 progress_dir = "outputs/oauth-sol61-vs-hogex-codex01621-ledger-v1-075x-s101-20261015/progress"
 save_dir = "outputs/oauth-sol61-vs-hogex-codex01621-ledger-v1-075x-s101-20261015/saves"
 
@@ -34,8 +40,9 @@ version = "0.162.1"
 reasoning_effort = "high"
 [env.p1.runtime]
 type = "prime"
-vm = true
-cpu = 4
-memory = 8
-disk = 20
+image = "python:3.12-slim-bookworm"
+workdir = "/work"
+cpu = 1
+memory = 2
+disk = 5
 idle_timeout = 14400

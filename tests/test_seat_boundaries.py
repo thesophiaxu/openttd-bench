@@ -1,5 +1,4 @@
-"""Where a seat's reach ends: retired seats, leftover processes, foreign harnesses, and one
-seat's failure never taking the rivals' scores with it."""
+"""Company authorization and independent agent failure semantics."""
 
 from __future__ import annotations
 
@@ -8,15 +7,10 @@ import importlib
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-from verifiers.v1 import DockerConfig, ProgramResult, Runtime
-from verifiers.v1.harnesses.bash import BashHarness, BashHarnessConfig
-
-from claude.harness import ClaudeHarness, ClaudeHarnessConfig
-from openttd_bench.env import GameBox, NoModelActivity, require_seat_harnesses, settle
+from fastapi import HTTPException, Request
+from openttd_bench.env import settle
 from openttd_bench.schema import schema_json
 from openttd_bench.tasks import free_for_all
 
@@ -55,47 +49,28 @@ def test_a_retired_seat_cannot_run_commands(core):
     assert core.run_batch(0, items, True)["results"][0]["ok"]  # its rival is unaffected
 
 
-# -- leftover processes are killed before the seat retires -------------------------------------
+def test_admin_requires_loopback_and_separate_token(core):
+    app = sys.modules["server.app"]
+    local = Request({"type": "http", "client": ("127.0.0.1", 1234)})
+    remote = Request({"type": "http", "client": ("10.0.0.2", 1234)})
+    assert app.admin_auth(local, "Bearer a") == "admin"
+    for request, credential, status in [(remote, "Bearer a", 403), (local, "Bearer t0", 401)]:
+        with pytest.raises(HTTPException) as error:
+            app.admin_auth(request, credential)
+        assert error.value.status_code == status
+    assert app.seat_auth("Bearer t0") == 0
+    assert app.seat_auth("Bearer t1") == 1
+    with pytest.raises(HTTPException):
+        app.seat_auth("Bearer a")
 
 
-class ReapBox(Runtime):
-    is_local = True
-
-    def __init__(self, exit_codes: list[int]) -> None:
-        super().__init__(name="reap")
-        self.config = DockerConfig(image="x")
-        self.exit_codes = exit_codes
-        self.calls: list[list[str]] = []
-
-    async def start(self) -> None:
-        pass
-
-    async def run(self, argv, env):
-        self.calls.append(argv)
-        return ProgramResult(self.exit_codes.pop(0), "", "")
-
-    async def _read(self, path):
-        raise FileNotFoundError(path)
-
-    async def write(self, path, data):
-        pass
-
-
-def test_reap_kills_until_the_seat_user_runs_nothing():
-    box = ReapBox([0, 0, 1])  # killed something twice (a forking loop), then nothing left
-    asyncio.run(GameBox(box, free_for_all.spec(101), {"ports": {"api": 3}}, {}, 1).reap("agent2"))
-    assert box.calls == [["pkill", "-KILL", "-u", "agent2"]] * 3
-
-
-# -- only SeatHarnesses may play a seat --------------------------------------------------------
-
-
-def test_a_root_harness_is_rejected_before_provisioning():
-    seat = SimpleNamespace(harness=ClaudeHarness(ClaudeHarnessConfig(id="claude")))
-    root = SimpleNamespace(harness=BashHarness(BashHarnessConfig(id="bash")))
-    require_seat_harnesses(SimpleNamespace(p1=seat, p2=seat), ["p1", "p2"])
-    with pytest.raises(TypeError, match="p2 uses harness 'BashHarness'"):
-        require_seat_harnesses(SimpleNamespace(p1=seat, p2=root), ["p1", "p2"])
+def test_native_listeners_bind_only_to_loopback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(str(IMAGE))
+    boot = importlib.import_module("init_game")
+    cfg = boot.write_cfg(SimpleNamespace(run=tmp_path, dev=True),
+                         free_for_all.spec(101).world(), "admin", "game")
+    assert "[server_bind_addresses]\n127.0.0.1\n" in cfg.read_text()
 
 
 # -- one seat failing never cancels its rivals ----------------------------------------------------
@@ -113,29 +88,7 @@ def test_one_failed_seat_leaves_the_others_playing():
     async def main():
         tasks = [asyncio.create_task(seat("a", 0.01, RuntimeError("harness crashed"))),
                  asyncio.create_task(seat("b", 0.05)), asyncio.create_task(seat("c", 0.05))]
-        return await settle(tasks, NoModelActivity)
+        return await settle(tasks)
 
     failures = asyncio.run(main())
     assert [str(f) for f in failures] == ["harness crashed"] and sorted(finished) == ["b", "c"]
-
-
-def test_a_seat_without_model_activity_aborts_the_episode():
-    cancelled: list[str] = []
-
-    async def seat(name: str, delay: float, fail: BaseException | None = None) -> None:
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            cancelled.append(name)
-            raise
-        if fail is not None:
-            raise fail
-
-    async def main():
-        tasks = [asyncio.create_task(seat("a", 0.01, NoModelActivity("no calls"))),
-                 asyncio.create_task(seat("b", 10))]
-        return await settle(tasks, NoModelActivity)
-
-    with pytest.raises(NoModelActivity):
-        asyncio.run(main())
-    assert cancelled == ["b"]

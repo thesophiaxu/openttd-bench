@@ -1,11 +1,4 @@
-"""Claude Code as a seat harness (plans/harness-layout.md).
-
-verifiers ships a `claude_code` harness, but it runs as root through an ACP adapter with a
-per-trace config dir; a seat needs the program demoted to its Unix user with its state in
-the seat home. This one installs the CLI once per box (root, world-readable, under the same
-lock discipline as the built-in) and runs `claude -p` non-interactively on the seat prompt,
-pointed at the interception endpoint through the Anthropic env vars.
-"""
+"""Pinned Claude Code CLI, run as root in an isolated agent VM via the proxy."""
 
 from __future__ import annotations
 
@@ -25,12 +18,9 @@ INSTALL = f"""\
 set -e
 export PATH="{NODE_BIN_DIR}:$PATH"
 mkdir -p {CLAUDE_DIR}
-exec 9>/tmp/claude-code-install.lock
-flock 9
 if [ -f {CLAUDE_DIR}/.ready ] && [ "$(cat {CLAUDE_DIR}/.ready)" = "$CLAUDE_CODE_VERSION" ]; then exit 0; fi
 rm -f {CLAUDE_DIR}/.ready
 npm install --prefix {CLAUDE_DIR} --no-audit --no-fund --omit=dev "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" >/dev/null
-chmod -R a+rX {CLAUDE_DIR} {NODE_BIN_DIR}/..
 echo "$CLAUDE_CODE_VERSION" > {CLAUDE_DIR}/.ready
 """
 
@@ -53,7 +43,6 @@ class ClaudeHarness(SeatHarness[ClaudeHarnessConfig]):
 
     def seat_env(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, str]:
         return {
-            "PATH": f"{CLAUDE_BIN_DIR}:{NODE_BIN_DIR}:$PATH",
             # The proxy serves the Anthropic dialect at <endpoint minus /v1>/v1/messages.
             "ANTHROPIC_BASE_URL": endpoint.rstrip("/").removesuffix("/v1"),
             "ANTHROPIC_API_KEY": secret,
@@ -70,8 +59,9 @@ class ClaudeHarness(SeatHarness[ClaudeHarnessConfig]):
 
     def seat_script(self, paths: SeatPaths) -> str:
         # Non-interactive: the whole task prompt is the first user turn, permissions are
-        # already bounded by the seat's Unix user, and the box has no other seat's material.
+        # bounded by the isolated VM; it contains no other agent's material.
         return (
+            f'export PATH="{CLAUDE_BIN_DIR}:{NODE_BIN_DIR}:$PATH"; '
             f"cd {shlex.quote(paths.workdir)} && cat {shlex.quote(paths.prompt_file)} | "
             f"claude -p --dangerously-skip-permissions --output-format text 2>&1"
         )

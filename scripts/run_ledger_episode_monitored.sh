@@ -12,22 +12,21 @@ mapfile -t meta < <(.venv/bin/python - "$OUT" <<'PY'
 import json,sys
 from pathlib import Path
 m=json.loads((Path(sys.argv[1])/'manifest.json').read_text())
-print(m['config']); print(m['label']); print(m['llm_seats']); print(m['company_count']); print(m['codex_version']); print(m['seed'])
+print(m['config']); print(m['label']); print(m['llm_seats']); print(m['codex_version']); print(m['seed'])
 for label in m['seat_labels']: print(label)
 PY
 )
 CONFIG=${meta[0]}
 LABEL=${meta[1]}
 LLM_SEATS=${meta[2]}
-COMPANIES=${meta[3]}
-CODEX_VERSION=${meta[4]}
-SEED=${meta[5]}
-labels=("${meta[@]:6}")
+CODEX_VERSION=${meta[3]}
+SEED=${meta[4]}
+labels=("${meta[@]:5}")
 .venv/bin/python scripts/prepare_scheduled_ledger.py "$OUT"
 (
   status=0
   .venv/bin/python -m openttd_bench.run_with_atif "$OUT" -- \
-    .venv/bin/eval @ "$CONFIG" -n 1 -r 1 -c 1 --no-serve --no-rich --output-dir "$OUT" || status=$?
+    .venv/bin/vf-run @ "$CONFIG" -n 1 -r 1 -c 1 --output-dir "$OUT" --run.dir vf || status=$?
   .venv/bin/python scripts/finalize_ledger_episode.py "$OUT" "$status"
 ) >"$OUT/eval.log" 2>&1 &
 eval_pid=$!
@@ -40,11 +39,11 @@ echo "$eval_pid" >"$OUT/eval.pid"
 watch_pid=$!
 echo "$watch_pid" >"$OUT/watch.pid"
 (
-  .venv/bin/python scripts/verify_mixed_start.py "$OUT" --pid "$eval_pid" --task-id "${TASK_ID:-codex-model-series}" --llm-seats "$LLM_SEATS" --companies "$COMPANIES" &&
+  .venv/bin/python scripts/verify_mixed_start.py "$OUT" --pid "$eval_pid" --task-id "${TASK_ID:-codex-model-series}" --llm-seats "$LLM_SEATS" &&
   .venv/bin/python - "$LABEL" <<'PY'
 import sys
 from scripts.watch_run import post
-post('small-pineapple-good-morning', 'OpenTTD: startup verified', sys.argv[1] + ': clock moving, all LLM seats active; initial funding, roster and ledger checks passed.')
+post('small-pineapple-good-morning', 'OpenTTD: startup verified', sys.argv[1] + ': clock moving, all LLM seats active, start date checked.')
 PY
 ) >"$OUT/verification.json" 2>&1 &
 verify_pid=$!

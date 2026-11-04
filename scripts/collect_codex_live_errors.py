@@ -7,20 +7,24 @@ files or assistant content. Watches future series stages automatically.
 import argparse
 import asyncio
 import json
-import re
 import shlex
 import time
 from pathlib import Path
 
 from prime_sandboxes import AsyncSandboxClient
 
+if __package__:
+    from .runtime_inventory import active_agents
+else:
+    from runtime_inventory import active_agents
+
 REMOTE = r'''
 import json,sys
 from pathlib import Path
 positions=json.loads(sys.argv[1]); result={}
 for seat,offset in positions.items():
- p=Path('/home/agent'+seat+'/codex-exec.jsonl')
- if not p.exists(): continue
+ p=Path('/root/codex-exec.jsonl')
+ if not p.is_file() or p.is_symlink(): continue
  if p.stat().st_size < offset: offset=0
  errors=[]; completed_tools=0
  with p.open('rb') as f:
@@ -39,6 +43,45 @@ print(json.dumps(result))
 '''
 
 
+async def scan_run(client, root: Path, state: dict):
+    """Scan each explicitly inventoried role VM; retain the historical seats schema."""
+    agents = active_agents(root)
+    if not agents:
+        return
+    destination = root / 'live/codex'
+    destination.mkdir(parents=True, exist_ok=True)
+    activity_path = destination / 'activity.json'
+    previous = json.loads(activity_path.read_text()).get('seats', {}) if activity_path.exists() else {}
+    activity = dict(previous)
+    for agent in agents:
+        sandbox = agent['sandbox_id']
+        seat = str(agent['company'] + 1)  # Legacy seat keys are one-based; company is zero-based.
+        positions = state.setdefault(sandbox, {})
+        attribution = {key: agent[key] for key in ('role', 'company', 'sandbox_id', 'trace_id', 'spec', 'task_idx')}
+        try:
+            result = await client.execute_command(sandbox, 'python3 -c ' + shlex.quote(REMOTE) + ' ' + shlex.quote(json.dumps({seat: positions.get(seat, 0)})), timeout=20)
+            if result.exit_code != 0:
+                raise RuntimeError('Native error scan command failed')
+            data = json.loads(result.stdout.strip())
+            if seat not in data:
+                continue
+            record = {**data[seat], **attribution}
+            old = previous.get(seat, {})
+            count = old.get('completed_tools_observed', 0) if old.get('sandbox_id') == sandbox else 0
+            record['completed_tools_observed'] = count + record['completed_tools_since_scan']
+            with (destination / f'agent{seat}-errors.jsonl').open('a') as file:
+                for event in record['errors']:
+                    file.write(json.dumps({**event, **attribution, 'observed_unix': time.time()}) + '\n')
+            positions[seat] = record['offset']
+            activity[seat] = record
+        except Exception as exc:
+            print(json.dumps({'event': 'native_scan_error', 'run': str(root), **attribution,
+                              'error_type': type(exc).__name__}), flush=True)
+    temporary = destination / 'activity.tmp'
+    temporary.write_text(json.dumps({'checked_unix': time.time(), 'seats': activity}, indent=2) + '\n')
+    temporary.replace(activity_path)
+
+
 async def main(series: Path):
     state_path = series.with_name(series.stem + '-native-error-cursors.json')
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -50,33 +93,12 @@ async def main(series: Path):
             root = Path(item['out'])
             try:
                 manifest = json.loads((root / 'manifest.json').read_text())
-            except json.JSONDecodeError:
+            except (FileNotFoundError, json.JSONDecodeError):
                 continue  # A startup verifier may be replacing this snapshot.
-            if manifest['status'] not in ('launching', 'running') or not (root / 'eval.log').exists():
+            if manifest['status'] not in ('launching', 'running'):
                 continue
-            matches = re.findall(r'prime: sandbox ([a-z0-9]+) up', (root / 'eval.log').read_text())
-            if not matches:
-                continue
-            sandbox = matches[-1]
-            positions = state.setdefault(sandbox, {str(i): 0 for i in range(1, manifest['llm_seats'] + 1)})
             try:
-                result = await client.execute_command(sandbox, 'python3 -c ' + shlex.quote(REMOTE) + ' ' + shlex.quote(json.dumps(positions)), timeout=20)
-                if result.exit_code != 0:
-                    raise RuntimeError('Native error scan command failed')
-                data = json.loads(result.stdout.strip())
-                destination = root / 'live/codex'
-                destination.mkdir(parents=True, exist_ok=True)
-                activity_path = destination / 'activity.json'
-                previous = json.loads(activity_path.read_text()).get('seats', {}) if activity_path.exists() else {}
-                for seat, record in data.items():
-                    record['completed_tools_observed'] = previous.get(seat, {}).get('completed_tools_observed', 0) + record['completed_tools_since_scan']
-                    with (destination / f'agent{seat}-errors.jsonl').open('a') as file:
-                        for event in record['errors']:
-                            file.write(json.dumps({**event, 'observed_unix': time.time()}) + '\n')
-                    positions[seat] = record['offset']
-                temporary_activity = destination / 'activity.tmp'
-                temporary_activity.write_text(json.dumps({'checked_unix': time.time(), 'seats': data}, indent=2) + '\n')
-                temporary_activity.replace(activity_path)
+                await scan_run(client, root, state)
             except Exception as exc:
                 print(json.dumps({'event': 'native_scan_error', 'run': str(root), 'error_type': type(exc).__name__}), flush=True)
         temporary = state_path.with_suffix('.tmp')

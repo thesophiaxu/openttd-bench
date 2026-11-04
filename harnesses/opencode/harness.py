@@ -1,10 +1,4 @@
-"""OpenCode as a seat harness (no built-in exists; plan 5.4, plans/harness-layout.md).
-
-`setup` downloads the pinned fork binary once per box (root-installed, world-executable,
-under a lock so concurrent seats don't race); the seat layer (`openttd_seat`) writes the
-prompt and this harness's provider config into the seat's home and runs the program
-demoted to the seat's Unix user.
-"""
+"""Pinned OpenCode fork, run as root in an isolated agent VM."""
 
 from __future__ import annotations
 
@@ -23,8 +17,6 @@ BIN_DIR = "/opt/opencode/bin"
 INSTALL = f"""\
 set -e
 mkdir -p {BIN_DIR}
-exec 9>/tmp/opencode-install.lock
-flock 9
 if [ -x {BIN_DIR}/opencode ]; then exit 0; fi
 case "$(uname -m)" in
   x86_64) OPENCODE_ARCH=x64 ;;
@@ -37,7 +29,6 @@ else python3 -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[
 tar -xzf /tmp/opencode.tar.gz -C /tmp
 install -m 755 /tmp/opencode {BIN_DIR}/opencode
 rm -f /tmp/opencode.tar.gz /tmp/opencode
-chmod -R a+rX /opt/opencode
 """
 
 
@@ -77,7 +68,7 @@ class OpenCodeHarness(SeatHarness[OpenCodeHarnessConfig]):
                 "compaction": {"auto": False, "prune": False},
                 # `opencode run` is non-interactive: a permission prompt is auto-rejected, which
                 # derailed seats that wrote scratch files under /tmp. Everything the seat can
-                # touch is already bounded by its Unix user, so allow all tool permissions.
+                # touch is bounded by its isolated VM, so allow all tool permissions.
                 "permission": {
                     "read": "allow",
                     "edit": "allow",
@@ -98,11 +89,14 @@ class OpenCodeHarness(SeatHarness[OpenCodeHarnessConfig]):
         return {f"{paths.home}/.config/opencode/opencode.json": self._build_config(ctx, endpoint, secret).encode()}
 
     def seat_env(self, ctx: ModelContext, paths: SeatPaths, endpoint: str, secret: str) -> dict[str, str]:
-        return {"PATH": f"{BIN_DIR}:$PATH", "OPENCODE_DISABLE_FILETIME_CHECK": "true"}
+        return {"OPENCODE_DISABLE_FILETIME_CHECK": "true"}
 
     def seat_script(self, paths: SeatPaths) -> str:
         # `opencode run` exits 0 even on provider errors: the seat layer keeps the output tail.
-        return f"cd {shlex.quote(paths.workdir)} && cat {shlex.quote(paths.prompt_file)} | opencode run 2>&1"
+        return (
+            f'export PATH="{BIN_DIR}:$PATH"; '
+            f"cd {shlex.quote(paths.workdir)} && cat {shlex.quote(paths.prompt_file)} | opencode run 2>&1"
+        )
 
     async def session_summary(self, runtime: Runtime, paths: SeatPaths) -> dict:
         return await opencode_session_summary(runtime, paths.home)

@@ -1,31 +1,24 @@
-"""OpenTTDEnv: one Env for all tasks — seats p1..p4 play one shared sandbox (plan 13).
-
-Per attempt: provision one box (retries get a fresh world), upload the payload, boot
-`init_game`, launch every LLM seat concurrently through per-seat runtime views, retire
-seats as they finish, run the clock out to the horizon, capture the terminal save and
-the grading snapshot, then score every seat in `finalize`.
-"""
+"""One authoritative OpenTTD server and one private Prime VM per agent, per episode."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import random
+import os
 import secrets
 import time
 from pathlib import Path
 from typing import Any
 
 import verifiers.v1 as vf
+from verifiers.v1.runtimes import make_backend
+from verifiers.v1.utils.aio import run_shielded
 
 from openttd_bench import grader
-from openttd_bench.activity import has_model_activity
-from openttd_bench.payload import build_payload
-from openttd_bench.seats import SeatRuntime
+from openttd_bench.payload import build_client_payload, build_server_payload
 from openttd_bench.task_spec import TaskSpec
 from openttd_bench.taskset import OpenTTDSeatTask, OpenTTDTask, agent_budget_seconds
-from openttd_seat import SeatHarness
 
 log = logging.getLogger(__name__)
 
@@ -34,18 +27,12 @@ ROOT = "/opt/openttd"
 BOOT_LOG = f"{ROOT}/boot.log"
 BOOT_MARKER = "/run/openttd/boot-complete"
 
-# The bearer token never crosses argv (world-readable via /proc/<pid>/cmdline, and Prime
-# wraps any `env` into a `sh -c` string): argv carries only the path of a 0600 file holding
-# it and the key to read — JSON (`seats.json`) or KEY=VALUE lines (`~agentN/.openttd_seat`).
+# Administration runs only inside the server VM; credentials stay in its JSON file.
 _API_SCRIPT = r"""
-import json, os, sys, urllib.request, urllib.error
+import json, sys, urllib.request, urllib.error
 method, url, token_path, token_key, body, timeout = sys.argv[1:7]
-with open(os.path.expanduser(token_path)) as f:
-    raw = f.read()
-try:
-    token = json.loads(raw)[token_key]
-except ValueError:
-    token = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)[token_key]
+with open(token_path) as f:
+    token = json.load(f)[token_key]
 data = body.encode() if body else None
 req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
 try:
@@ -66,7 +53,7 @@ async def box_api(
     token_file: tuple[str, str],
     timeout: float = 60,
 ) -> dict[str, Any]:
-    """Call the in-box control plane from the host through `runtime.run` (loopback-only server).
+    """Call the loopback-only admin routes from the host through the server runtime.
     `token_file` is `(path, key)` of the in-box file holding the bearer token, never the token."""
     path, key = token_file
     result = await runtime.run(
@@ -104,7 +91,7 @@ class GameBox:
         return await box_api(self.box, method, f"{self.api_url}{path}", body, ADMIN_TOKEN, timeout)
 
     async def boot(self) -> dict[str, Any]:
-        payload = build_payload(self.spec, self.seats, self.world)
+        payload = build_server_payload(self.spec, self.seats, self.world)
         await self.box.write(f"{ROOT}/payload.tgz", payload)
         unpack = await self.box.run(
             [
@@ -147,20 +134,6 @@ class GameBox:
         tail = await self.box.run(["tail", "-c", "2000", BOOT_LOG], {})
         raise vf.SandboxError(f"world did not boot within {self.boot_seconds}s: {tail.stdout[-1500:]}")
 
-    async def reap(self, user: str) -> None:
-        """Kill everything the seat's Unix user still runs (a `setsid nohup` loop outlives
-        its harness). Repeated: a process may fork while the previous pass runs."""
-        for _ in range(5):
-            try:
-                result = await self.box.run(["pkill", "-KILL", "-u", user], {})
-            except vf.SandboxError as exc:
-                log.warning("reap %s: %s", user, exc)
-                return
-            if result.exit_code == 1:  # nothing matched: the user runs nothing
-                return
-            await asyncio.sleep(0.5)
-        log.warning("reap %s: processes kept appearing after 5 passes", user)
-
     async def retire(self, company: int) -> None:
         try:
             await self.admin("POST", "/api/admin/retire", {"company": company})
@@ -184,33 +157,8 @@ def make_seats(count: int) -> dict[str, Any]:
     return {"tokens": {secrets.token_hex(16): slot for slot in range(count)}, "admin": secrets.token_hex(16)}
 
 
-def pick_ports(idx: int) -> dict[str, int]:
-    """Per-episode loopback ports (docker host networking shares the host loopback)."""
-    base = 20000 + (random.randrange(0, 400) * 100) + (idx % 10) * 10
-    return {"game": base + 1, "admin": base + 2, "api": base + 3}
-
-
-def require_seat_harnesses(agents: Any, roles: list[str]) -> None:
-    """Fail closed before provisioning: seat isolation (own Unix user via setpriv, own token
-    file) lives in SeatHarness, and any other harness (the verifiers default is `bash`) runs
-    the seat as root, which reads every secret in the box."""
-    for role in roles:
-        harness = getattr(agents, role).harness
-        if not isinstance(harness, SeatHarness):
-            raise TypeError(
-                f"{role} uses harness {type(harness).__name__!r}; OpenTTD seats need a SeatHarness "
-                "(opencode, claude, codex-cli, codex-prime): others run as root and break seat isolation"
-            )
-
-
-class NoModelActivity(vf.SandboxError):
-    """A seat's harness exited without model activity (`require_model_activity`): the
-    episode is void, so it aborts at once instead of playing the rivals out."""
-
-
-async def settle(tasks: list[asyncio.Task], fatal: type[BaseException]) -> list[BaseException]:
-    """Await every seat; one seat failing never cancels its rivals. Returns the failures,
-    except a `fatal` one, which cancels the rest and is raised."""
+async def settle(tasks: list[asyncio.Task]) -> list[BaseException]:
+    """Await every seat; one seat failing never cancels its rivals. Returns the failures."""
     pending = set(tasks)
     failures: list[BaseException] = []
     try:
@@ -218,8 +166,6 @@ async def settle(tasks: list[asyncio.Task], fatal: type[BaseException]) -> list[
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for finished in done:
                 exc = finished.exception()
-                if isinstance(exc, fatal):
-                    raise exc
                 if exc is not None:
                     failures.append(exc)
     finally:
@@ -231,10 +177,13 @@ async def settle(tasks: list[asyncio.Task], fatal: type[BaseException]) -> list[
 
 
 class OpenTTDEnvConfig(vf.EnvConfig):
-    p1: vf.AgentConfig = vf.AgentConfig()
-    p2: vf.AgentConfig = vf.AgentConfig()
-    p3: vf.AgentConfig = vf.AgentConfig()
-    p4: vf.AgentConfig = vf.AgentConfig()
+    server: vf.PrimeConfig = vf.PrimeConfig(
+        image="python:3.12-slim-bookworm", cpu=4, memory=8, disk=20, idle_timeout=43200
+    )
+    p1: vf.AgentConfig = vf.AgentConfig(runtime=vf.PrimeConfig(image="python:3.12-slim-bookworm", workdir="/work"))
+    p2: vf.AgentConfig = vf.AgentConfig(runtime=vf.PrimeConfig(image="python:3.12-slim-bookworm", workdir="/work"))
+    p3: vf.AgentConfig = vf.AgentConfig(runtime=vf.PrimeConfig(image="python:3.12-slim-bookworm", workdir="/work"))
+    p4: vf.AgentConfig = vf.AgentConfig(runtime=vf.PrimeConfig(image="python:3.12-slim-bookworm", workdir="/work"))
 
 
 class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
@@ -251,29 +200,51 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
         config = self.taskset.config
         rotation = (task.data.idx or 0) % seats
         role_of = {company: ROLES[(company + rotation) % seats] for company in range(seats)}
-        require_seat_harnesses(agents, sorted(set(role_of.values())))
+        runtimes = {role: getattr(agents, role).runtime_config for role in role_of.values()}
+        if not all(isinstance(runtime, vf.PrimeConfig) for runtime in runtimes.values()):
+            raise ValueError("OpenTTD multi-sandbox episodes require Prime runtimes for every active role")
         tokens = make_seats(seats)
         token_of = {company: token for token, company in tokens["tokens"].items()}
         world = spec.world()
-        world["ports"] = pick_ports(task.data.idx or 0)
         agent_seconds = config.agent_seconds or agent_budget_seconds(spec)
 
-        async with getattr(agents, ROLES[0]).provision(task) as box:
-            game = GameBox(box, spec, world, tokens, config.boot_seconds)
+        deployment = vf.Deployment(make_backend(self.config.server), spec=vf.ServicesSpec(runtimes))
+        inventory = {
+            "spec": spec.name, "task_idx": task.data.idx,
+            "server": {"sandbox_id": None, "status": "booting"},
+            "agents": {role: {"company": company, "sandbox_id": None, "trace_id": None,
+                              "home": "/root", "workdir": runtimes[role].workdir or "/app", "status": "booting"}
+                       for company, role in role_of.items()},
+        }
+        inventory_path = Path(os.environ.get("OPENTTD_RUN_DIR", config.save_dir)) / "live/runtimes" / f"{deployment.backend.name}.json"
+
+        def save_inventory() -> None:
+            inventory_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = inventory_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(inventory, indent=2) + "\n")
+            tmp.replace(inventory_path)
+
+        try:
+            save_inventory()
+            async with asyncio.timeout(config.boot_seconds):
+                await deployment.start()
+            inventory["server"].update(sandbox_id=deployment.workspace.info.id, status="running")
+            lan = getattr(deployment.backend, "lan", None)
+            if lan:
+                inventory["server"]["lan_id"] = lan[0]
+            for role in runtimes:
+                inventory["agents"][role].update(sandbox_id=deployment.target(role).info.id, status="running")
+            save_inventory()
+            game = GameBox(deployment.workspace, spec, world, tokens, config.boot_seconds)
+            api_url = f"http://{deployment.hosts['main']}:{world['ports']['api']}"
+            client_payload = build_client_payload(spec)
             health = await game.boot()
             log.info("world %s ready: %s", spec.name, health.get("date"))
             audit_dir = Path(config.save_dir) / f"{spec.name}-{task.data.idx or 0}"
             audit_dir.mkdir(parents=True, exist_ok=True)
             initial = await game.snapshot()
-            from openttd_bench.accounting import validate_accounting
             (audit_dir / "initial-snapshot.json").write_text(json.dumps(initial, indent=2) + "\n")
-            validate_accounting(initial, range(len(spec.companies)))
-            for slot, company in enumerate(spec.companies):
-                state = initial["companies"][str(slot)]
-                if state["cash"] != company.starting_cash or state["loan"] != company.starting_loan:
-                    raise vf.SandboxError(f"incorrect initial funding for company {slot}: {state}")
-                if spec.rules.max_loan == 0 and state.get("max_loan") != 0:
-                    raise vf.SandboxError(f"borrowing was not disabled for company {slot}: {state}")
+            grader.check_scorable(spec, initial)
             for filename, value in (("spec.json", spec.model_dump(mode="json")),
                                     ("world.json", world), ("initial-snapshot.json", initial)):
                 (audit_dir / filename).write_text(json.dumps(value, indent=2) + "\n")
@@ -284,11 +255,11 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
                 log.warning("world %s booted paused; waiting for launch gate %s", spec.name, config.launch_gate)
                 while not Path(config.launch_gate).exists():
                     await asyncio.sleep(2)
-            views = {company: SeatRuntime(box, role_of[company]) for company in range(seats)}
             traces: list[vf.Trace] = []
 
             async def play(company: int) -> None:
                 role = role_of[company]
+                runtime = deployment.target(role)
                 seat_task = OpenTTDSeatTask(
                     task.data.model_copy(
                         update={
@@ -300,30 +271,36 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
                     spec=spec,
                     company=company,
                     token=token_of[company],
-                    api_url=game.api_url,
-                    user=f"agent{company + 1}",
+                    api_url=api_url,
+                    client_payload=client_payload,
                 )
+                def stamp(trace: vf.Trace) -> None:
+                    trace.info.update(openttd_company=company, openttd_role=role, openttd_spec=spec.name,
+                                      openttd_server_id=deployment.workspace.info.id)
+                    inventory["agents"][role]["trace_id"] = trace.id
+                    save_inventory()
+
                 try:
-                    trace = await getattr(agents, role).run(seat_task, runtime=views[company])
-                    trace.info["openttd_company"] = company
-                    trace.info["openttd_role"] = role
-                    trace.info["openttd_spec"] = spec.name
+                    trace = await getattr(agents, role).run(seat_task, runtime=runtime, on_trace=stamp)
                     traces.append(trace)
-                    if config.require_model_activity and not has_model_activity(trace.calls, trace.info):
-                        raise NoModelActivity(
-                            f"{role} exited without model activity: "
-                            f"{trace.info.get('harness_output_tail', '')[-1000:]}"
-                        )
                 finally:
-                    await game.reap(f"agent{company + 1}")
-                    await game.retire(company)
+                    async def release() -> None:
+                        try:
+                            async with asyncio.timeout(90):
+                                await game.retire(company)
+                        finally:
+                            await runtime.backend.stop()
+                            inventory["agents"][role]["status"] = "stopped"
+                            save_inventory()
+                    await run_shielded(release())
 
             progress = asyncio.create_task(self.report_progress(game, task, config))
             try:
                 seat_tasks = [asyncio.create_task(play(company)) for company in range(seats)]
-                failures = await settle(seat_tasks, NoModelActivity)
+                failures = await settle(seat_tasks)
             finally:
                 progress.cancel()
+                await asyncio.gather(progress, return_exceptions=True)
             if failures and not traces:
                 raise failures[0]
             seat_failures = [f"{type(exc).__name__}: {exc}"[:500] for exc in failures]
@@ -334,19 +311,16 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
             snapshot = await game.snapshot()
             (audit_dir / "final-snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
             try:
-                validate_accounting(snapshot, range(len(spec.companies)))
+                grader.check_scorable(spec, snapshot)
             except ValueError:
                 # Preserve diagnostic evidence even when we must refuse to score.
                 try:
-                    failed_save = await game.save(f"invalid-accounting-{spec.name}")
+                    failed_save = await game.save(f"invalid-snapshot-{spec.name}")
                     if failed_save.get("exists"):
-                        (audit_dir / "invalid-accounting.sav").write_bytes(await game.read(failed_save["path"]))
+                        (audit_dir / "invalid-snapshot.sav").write_bytes(await game.read(failed_save["path"]))
                 except Exception as exc:
-                    (audit_dir / "invalid-accounting-save-error.txt").write_text(str(exc))
+                    (audit_dir / "invalid-snapshot-save-error.txt").write_text(str(exc))
                 raise
-            if spec.rules.max_loan == 0:
-                if any(c.get("loan") != 0 or c.get("max_loan") != 0 for c in snapshot["companies"].values()):
-                    raise vf.SandboxError("nonzero loan/cap in no-borrowing final snapshot")
             all_results = [
                 {"seat": slot + 1, "kind": company.seat, "name": company.name,
                  **grader.metrics(spec, snapshot, slot, grader.score(spec, snapshot, slot))}
@@ -370,6 +344,13 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
                 trace.info["openttd_run_out"] = run_out
                 trace.info["openttd_clock"] = spec.rules.clock
                 trace.info["openttd_seat_failures"] = seat_failures
+        finally:
+            await deployment.close()
+            inventory["server"].update(sandbox_id=deployment.backend.info.id, status="closed")
+            for role, backend in deployment.target_backends.items():
+                if role in inventory["agents"]:
+                    inventory["agents"][role].update(sandbox_id=backend.info.id, status="closed")
+            save_inventory()
 
     async def report_progress(self, game: GameBox, task: OpenTTDTask, config: Any) -> None:
         """While the seats play, append a snapshot line every `progress_seconds` to
@@ -417,12 +398,9 @@ class OpenTTDEnv(vf.Env[OpenTTDEnvConfig]):
 
 __all__ = [
     "GameBox",
-    "NoModelActivity",
     "OpenTTDEnv",
     "OpenTTDEnvConfig",
     "box_api",
     "make_seats",
-    "pick_ports",
-    "require_seat_harnesses",
     "settle",
 ]

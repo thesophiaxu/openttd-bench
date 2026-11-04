@@ -12,8 +12,6 @@ from openttd_bench import tasks
 from openttd_bench.task_spec import TaskSpec
 from openttd_bench.tasks.tasks_shared import SEEDS
 
-DEFAULT_IMAGE = "openttd-bench:v3"
-WORKDIR = "/work"
 SOFT_BUDGET_FRACTION = 0.8
 """End the agent phase at this fraction of its wall budget so retirement, run-out and
 scoring always run (an overrun raises HarnessError and skips finalize + scoring)."""
@@ -37,9 +35,6 @@ class OpenTTDConfig(TasksetConfig):
     """One of `openttd_bench.tasks.EXPERIMENTS` (a scenario module under `openttd_bench/tasks/`)."""
     params: dict[str, Any] = {}
     """Keyword arguments for the experiment's `spec` (e.g. seats, cash, loans, speed)."""
-    image: str = DEFAULT_IMAGE
-    """Box image. The local docker image caches the binaries; any stock python image
-    works too — `init_game` bootstraps the pinned content at setup (Prime)."""
     seeds: list[int] = []
     """Map seeds (empty = the experiment's default four)."""
     model: str = ""
@@ -56,8 +51,6 @@ class OpenTTDConfig(TasksetConfig):
     """Where the env appends per-episode progress lines while the seats play."""
     launch_gate: str | None = None
     """Optional host file: provision/boot paused, but do not start agents until it exists."""
-    require_model_activity: bool = False
-    """Abort if a harness exits without intercepted calls or native Codex activity evidence."""
     progress_seconds: int = 600
     """Interval between progress lines (0 disables)."""
 
@@ -71,34 +64,64 @@ class OpenTTDTask(Task[TaskData, Any]):
 
 
 class OpenTTDSeatTask(OpenTTDTask):
-    """One seat's rollout inside the shared box: per-seat env, retire on finish."""
+    """One company in its own VM. Only its client and credential are staged here."""
 
-    def __init__(self, data: TaskData, spec: TaskSpec, company: int, token: str, api_url: str, user: str) -> None:
+    def __init__(
+        self, data: TaskData, spec: TaskSpec, company: int, token: str, api_url: str, client_payload: bytes
+    ) -> None:
         super().__init__(data, spec)
-        self.company = company
-        self.token = token
-        self.api_url = api_url
-        self.user = user
+        self.company, self.token, self.api_url = company, token, api_url
+        self.client_payload = client_payload
 
     def runtime_env(self) -> dict[str, str]:
-        # No OPENTTD_API_TOKEN: a runtime may carry its env on a root wrapper's argv (Prime does),
-        # readable by every seat. The demoted shell sources it from `~agentN/.openttd_seat` (0600).
-        return {
-            "OPENTTD_API_URL": self.api_url,
-            "OPENTTD_SEAT": str(self.company),
-            "OPENTTD_SEAT_USER": self.user,
-        }
+        return {"HOME": "/root", "OPENTTD_API_URL": self.api_url, "OPENTTD_SEAT": str(self.company)}
 
-    async def finalize(self, trace: Trace, runtime: Runtime) -> None:
-        """Retire the seat from the clock barrier; the company keeps operating."""
-        from openttd_bench.env import box_api
-
-        try:
-            trace.info["openttd_retired"] = await box_api(
-                runtime, "POST", f"{self.api_url}/api/retire", {}, (f"~{self.user}/.openttd_seat", "OPENTTD_API_TOKEN")
-            )
-        except Exception as exc:  # noqa: BLE001 - the env retires again anyway
-            trace.info["openttd_retire_error"] = str(exc)
+    async def setup(self, trace: Trace, runtime: Runtime) -> None:
+        await runtime.write("/tmp/openttd-client.tgz", self.client_payload)
+        result = await runtime.run(["sh", "-ec", (
+            "mkdir -p /opt/openttd /root && tar -xzf /tmp/openttd-client.tgz -C /opt/openttd && "
+            "rm /tmp/openttd-client.tgz && cp /opt/openttd/client/ottd /usr/local/bin/ottd && "
+            "chmod 755 /usr/local/bin/ottd && "
+            "python3 -c 'import pathlib,site; "
+            "pathlib.Path(site.getsitepackages()[0],\"openttd_client.pth\").write_text(\"/opt/openttd/client\\n\")'"
+        )], {})
+        if result.exit_code:
+            raise RuntimeError(f"client install failed: {result.stderr[-500:]}")
+        await runtime.write("/root/.openttd_seat", (
+            f"OPENTTD_API_URL={self.api_url}\nOPENTTD_API_TOKEN={self.token}\nOPENTTD_SEAT={self.company}\n"
+        ).encode())
+        result = await runtime.run(["chmod", "600", "/root/.openttd_seat"], {})
+        if result.exit_code:
+            raise RuntimeError("could not protect client credential file")
+        # Fail closed before any harness starts: correct identity, no server material,
+        # admin HTTP denied, and the native game/admin sockets unreachable over the LAN.
+        probe = """
+import pathlib, socket, sys
+from urllib.parse import urlsplit
+from openttd_client.transport import Transport, OpenTTDError
+t = Transport(timeout=15)
+assert t.request('GET', '/api/state')['seat']['company'] == int(sys.argv[1])
+assert not any(pathlib.Path('/opt/openttd', p).exists() for p in ('server', 'seats.json', 'world.json'))
+try:
+    t.request('GET', '/api/admin/snapshot')
+except OpenTTDError as error:
+    assert error.status == 403
+else:
+    raise AssertionError('admin API reachable from agent VM')
+for port in sys.argv[2:]:
+    try:
+        with socket.create_connection((urlsplit(t.url).hostname, int(port)), timeout=3) as connection:
+            # Prime's LAN proxy accepts TCP before dialing the destination: an
+            # immediate EOF/reset means denied; an open/speaking socket is unsafe.
+            assert connection.recv(1) == b'', f'native server port {port} reachable from agent VM'
+    except (ConnectionRefusedError, ConnectionResetError):
+        continue
+"""
+        result = await runtime.run(["python3", "-c", probe, str(self.company),
+                                    str(self.spec.ports.game), str(self.spec.ports.admin)], {})
+        if result.exit_code:
+            raise RuntimeError(f"agent boundary check failed: {result.stderr[-500:]}")
+        trace.info["openttd_client_ready"] = True
 
     @stop
     async def out_of_wall_clock(self, trace: Trace) -> bool:
@@ -123,8 +146,6 @@ class OpenTTDTaskset(Taskset[OpenTTDTask, OpenTTDConfig]):
                     idx=idx,
                     name=spec.name,
                     prompt=spec.companies[0].prompt,
-                    image=self.config.image,
-                    workdir=WORKDIR,
                     timeout=TaskTimeout(
                         setup=self.config.boot_seconds,
                         agent=agent_seconds,

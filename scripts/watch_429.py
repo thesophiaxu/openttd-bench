@@ -45,9 +45,15 @@ def scan_file(path: Path, state: dict, label: str) -> list[dict]:
             if fingerprint in state["seen"]:
                 continue
             state["seen"].append(fingerprint)
+            try:
+                native = json.loads(text)
+            except ValueError:
+                native = {}
+            attribution = {k: native[k] for k in ('role', 'company', 'sandbox_id', 'trace_id')
+                           if isinstance(native, dict) and k in native}
             events.append({"event": "rate_limit_429", "detected_unix": time.time(), "label": label,
                            "file": key, "byte_offset": start, "request_ids": ids,
-                           "fingerprint": fingerprint})
+                           "fingerprint": fingerprint, **attribution})
     return events
 
 

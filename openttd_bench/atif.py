@@ -390,10 +390,22 @@ def convert_run(run: Path, codex_dirs: list[Path] | None = None) -> dict:
                 harvest = session.get("harvested_to")
                 is_codex = trace.get("agent", {}).get("config", {}).get("harness", {}).get("id") in ("codex-cli", "codex_cli")
                 if harvest or is_codex:
-                    directory = resolve_harvest(harvest, run) if harvest else run / "raw" / "codex" / trace.get("info", {}).get("seat_user", "")
+                    directory = resolve_harvest(harvest, run) if harvest else run / "raw" / "codex" / trace["id"]
                     native = codex_forest(directory) if directory.is_dir() else []
                     if not native:
+                        # Root is shared as a username, never as an artifact identity.
+                        # Trace IDs isolate new captures; agentN names are historical only.
+                        for base in [run / "raw" / "codex", *(codex_dirs or [])]:
+                            candidate = base if base.name == trace["id"] else base / trace["id"]
+                            if candidate.is_dir():
+                                native = codex_forest(candidate)
+                                if native:
+                                    directory = candidate
+                                    break
+                    if not native:
                         seat = trace.get("info", {}).get("seat_user")
+                        if seat == "root":
+                            seat = None
                         candidates = []
                         for base in [run / "raw" / "codex", *(codex_dirs or [])]:
                             if not base.is_dir() or not seat:
@@ -405,7 +417,7 @@ def convert_run(run: Path, codex_dirs: list[Path] | None = None) -> dict:
                             directory = candidates[0]
                             native = codex_forest(directory)
                         if not native:
-                            raise ValueError(f"Missing/ambiguous Codex sessions for {trace['id']}: {directory}; supply --codex-dir with seat directories")
+                            raise ValueError(f"Missing/ambiguous Codex sessions for {trace['id']}: {directory}; supply --codex-dir with trace-ID (or historical agentN) directories")
                     consumed_dirs.add(directory.resolve())
                     if len(native) == 1:
                         native[0]["extra"].update(benchmark=doc["extra"]["benchmark"], episode=episode,
